@@ -14,6 +14,9 @@ importers:
       '@cloudsforge/contracts-auth':
         specifier: link:../contracts/packages/auth
         version: link:../contracts/packages/auth
+      '@cloudsforge/contracts-events':
+        specifier: link:../contracts/packages/events
+        version: link:../contracts/packages/events
       '@cloudsforge/db':
         specifier: file:../runtime/packages/db
         version: file:../runtime/packages/db
