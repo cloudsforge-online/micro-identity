@@ -31,6 +31,7 @@
 import { createHash } from 'node:crypto'
 import { withOutbox, type Db } from './outbox.ts'
 import { organisationsOrphanedBy } from './organisations.ts'
+import { emitSessionRevoked } from './sessions.ts'
 
 /** The user is the sole owner of an organisation that is not theirs alone. */
 export class WouldOrphanOrganisationsError extends Error {
@@ -97,6 +98,18 @@ export async function requestDeletion(
         from sessions s
        where s.id = t.session_id and s.user_id = ${input.userId} and t.revoked = false
     `
+    // Announced like every other revocation. `account_deletion_requested` is not `signed_out`, so
+    // notify alerts on it — which is correct and is the point: if somebody ELSE asked for this
+    // account to be deleted, the alert on every device losing access is how the owner finds out
+    // while the grace window is still open and the deletion can still be cancelled.
+    for (const session of sessions) {
+      emitSessionRevoked(emit, {
+        sessionId: session.id,
+        userId: input.userId,
+        reason: 'account_deletion_requested',
+        correlationId: input.correlationId,
+      })
+    }
 
     emit({
       topic: 'identity.user.deleted',

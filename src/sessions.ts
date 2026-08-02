@@ -285,14 +285,22 @@ export async function revokeSession(
   userId: string,
   sessionId: string,
   reason: string,
+  correlationId: string,
 ): Promise<boolean> {
-  const outcome = await sql.begin(async (tx) => {
+  // `withOutbox` rather than a bare `sql.begin`: the event has to be written in the SAME
+  // transaction as the revocation, or a crash between them leaves a session that is over and a
+  // user who is never told. That is the failure mode the outbox pattern exists for, and it matters
+  // more here than almost anywhere — this is the event notify raises a CRITICAL security alert
+  // from, so a dropped one is a takeover nobody is warned about.
+  return withOutbox(sql, 'identity', async (tx, emit) => {
     const found = await tx<{ refresh_family_id: string }[]>`
       select refresh_family_id from sessions
        where id = ${sessionId} and user_id = ${userId} and status = 'active'
     `
     const familyId = found[0]?.refresh_family_id
-    if (!familyId) return { revoked: false }
+    // No row means nothing was revoked, so nothing is announced. Emitting here would notify a user
+    // every time a client retried a sign-out it had already completed.
+    if (!familyId) return false
 
     await tx`select pg_advisory_xact_lock(hashtext(${familyId})::bigint)`
     await tx`
@@ -300,9 +308,9 @@ export async function revokeSession(
        where id = ${sessionId}
     `
     await tx`update refresh_tokens set revoked = true where family_id = ${familyId} and revoked = false`
-    return { revoked: true }
+    emitSessionRevoked(emit, { sessionId, userId, reason, correlationId })
+    return true
   })
-  return outcome.revoked
 }
 
 /**
@@ -318,12 +326,24 @@ export async function revokeSession(
  */
 export async function revokeAllSessions(
   sql: Db,
-  userId: string,
-  reason: string,
-  keepSessionId?: string,
+  input: {
+    readonly userId: string
+    readonly reason: string
+    readonly correlationId: string
+    readonly keepSessionId?: string
+  },
 ): Promise<number> {
-  const keep = keepSessionId ?? null
-  const outcome = await sql.begin(async (tx) => {
+  /* AN OBJECT AND NOT FOUR POSITIONAL ARGUMENTS, because the positional form was written first and
+   * was wrong within the hour. Adding `correlationId` before the optional `keepSessionId` made the
+   * signature three adjacent strings, and a call that used to pass `keepSessionId` fourth silently
+   * began passing it as the correlation id — the session the user asked to KEEP was revoked, and
+   * every string type-checked perfectly. The suite caught it; nothing else would have.
+   *
+   * `reason` in particular decides whether a user gets a critical security alert, so a call site
+   * that can quietly shift its arguments along by one is not an acceptable shape here. */
+  const { userId, reason, correlationId } = input
+  const keep = input.keepSessionId ?? null
+  return withOutbox(sql, 'identity', async (tx, emit) => {
     const revoked = await tx<{ id: string }[]>`
       update sessions
          set status = 'revoked', revoked_at = now(), revoke_reason = ${reason}
@@ -343,9 +363,15 @@ export async function revokeAllSessions(
          and s.status <> 'active'
          and t.revoked = false
     `
-    return { count: revoked.length }
+    // ONE EVENT PER SESSION, not one per operation. Each revoked row is a device losing access, and
+    // notify dedupes on the session id precisely so that "sign out everywhere" produces one
+    // notification per device rather than one for the lot — which is what a user needs to see to
+    // tell how far a compromise reached.
+    for (const session of revoked) {
+      emitSessionRevoked(emit, { sessionId: session.id, userId, reason, correlationId })
+    }
+    return revoked.length
   })
-  return outcome.count
 }
 
 /**
@@ -356,14 +382,22 @@ export async function revokeAllSessions(
  * sign its owner out, which it already had by a shorter path: presenting it to the refresh route
  * outside the grace window burns the same family and raises an alert while doing it.
  */
-export async function revokeSessionByToken(sql: Db, token: string): Promise<void> {
+export async function revokeSessionByToken(
+  sql: Db,
+  token: string,
+  correlationId: string,
+): Promise<void> {
   const tokenHash = createHash('sha256').update(token).digest('hex')
   const rows = await sql<{ session_id: string; user_id: string }[]>`
     select session_id, user_id from refresh_tokens where token_hash = ${tokenHash} limit 1
   `
   const row = rows[0]
   if (!row) return
-  await revokeSession(sql, row.user_id, row.session_id, 'signed_out')
+  // `signed_out` is the ONE reason notify treats as not-news, and this is the call site that earns
+  // it: a user signing themselves out with the refresh token they are holding. Every other
+  // revocation reason in this service raises a critical alert, which is the correct default — an
+  // unrecognised reason is exactly when someone should look.
+  await revokeSession(sql, row.user_id, row.session_id, 'signed_out', correlationId)
 }
 
 /**
@@ -377,12 +411,18 @@ export async function revokeSessionByToken(sql: Db, token: string): Promise<void
  * fires when a stolen token is replayed outside the grace window. The third is a security event a
  * user must be able to see, and today nothing downstream can tell it happened at all.
  *
- * So the emit is correct and the estate has not caught up with it. `topics.ts` records it in
- * `AWAITING_REGISTRATION` with the exact `TopicSpec` that `@cloudsforge/contracts-events` needs, and
- * the guard there fails the moment contracts adopts it and this quarantine is not cleaned up.
- * Until then the event is written and delivered; what is missing is a consumer allowed to name it,
- * because `activity` classifies `satisfies Record<TopicName, _>` and cannot reference a topic the
- * registry has not declared.
+ * **This function used to have no caller, and this paragraph used to claim the opposite.** It said
+ * "the event is written and delivered; what is missing is a consumer allowed to name it". Neither
+ * half was true. `revokeSession` and `revokeAllSessions` updated the session rows and emitted
+ * nothing, so the event was never written at all — while `micro-notify` had landed a CRITICAL rule
+ * on the topic and `micro-contracts` had registered it. Every topic check in `topics.ts` passed
+ * throughout, because they reconcile topic NAMES and the name here was always spelled correctly.
+ * `unreferencedEmitters` was added to close exactly that hole, and it fails if this function loses
+ * its callers again.
+ *
+ * The reason string is what decides whether a user is warned: notify alerts on every reason EXCEPT
+ * `signed_out`. So the value each call site passes is a security decision, not a label — see
+ * `revokeSessionByToken` for the one case that is deliberately silent.
  *
  * Keyed on the session rather than the user: two revocations of the same session must stay in
  * order relative to each other, and a revocation has no ordering relationship to anything else.

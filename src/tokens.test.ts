@@ -145,12 +145,106 @@ test('identity.session.created and identity.device.added are written in the same
   assert.ok(!JSON.stringify(events).includes(user.email) || true)
 })
 
+/* ------------------------------------------- identity.session.revoked actually reaches the bus */
+
+/** Every `identity.session.revoked` row on the bus, oldest first. */
+async function revocationEvents(): Promise<{ key: string; payload: Record<string, unknown> }[]> {
+  return sql<{ key: string; payload: Record<string, unknown> }[]>`
+    select key, payload from outbox
+     where topic = 'identity.session.revoked' order by occurred_at
+  `
+}
+
+test('ending a session puts identity.session.revoked on the bus', { skip }, async () => {
+  // THE DEFECT THIS PROVES FIXED. `emitSessionRevoked` existed, was correct, and was called by
+  // nothing: revokeSession updated the rows and emitted silence. Every topic check passed, because
+  // they reconcile topic NAMES and the name was spelled correctly — see `unreferencedEmitters`.
+  // Meanwhile notify had a CRITICAL rule on this topic that could never fire.
+  const { user, sessionId } = await open()
+  // `.length`, not `deepEqual(…, [])`: postgres.js returns a `Result`, not a plain array, and
+  // node:assert/strict compares prototypes — so the empty case fails against `[]` for a reason
+  // that has nothing to do with the bus.
+  assert.equal((await revocationEvents()).length, 0, 'nothing revoked yet')
+
+  await revokeSession(db, user.id, sessionId, 'signed_out', 'corr-1')
+
+  const events = await revocationEvents()
+  assert.equal(events.length, 1, 'the revocation must be announced')
+  // Keyed on the session, per the registry: two revocations of one session stay ordered relative
+  // to each other, and notify dedupes on it.
+  assert.equal(events[0]?.key, sessionId)
+  assert.equal(events[0]?.payload['sessionId'], sessionId)
+  assert.equal(events[0]?.payload['userId'], user.id)
+  assert.equal(events[0]?.payload['reason'], 'signed_out')
+})
+
+test('a revocation that changed nothing announces nothing', { skip }, async () => {
+  // Idempotency has to reach the bus too. A client retrying a sign-out it already completed must
+  // not produce a second notification for a device that was already gone.
+  const { user, sessionId } = await open()
+  await revokeSession(db, user.id, sessionId, 'signed_out', 'corr-1')
+  await revokeSession(db, user.id, sessionId, 'signed_out', 'corr-2')
+  assert.equal((await revocationEvents()).length, 1, 'one revocation, one event')
+})
+
+test('sign out everywhere announces one event per device', { skip }, async () => {
+  const user = await makeUser()
+  const a = await startSession(db, { userId: user.id, client: CLIENT, amr: ['pwd'], correlationId: 't' })
+  const b = await startSession(db, {
+    userId: user.id,
+    client: { ...CLIENT, userAgent: 'Chrome/120' },
+    amr: ['pwd'],
+    correlationId: 't',
+  })
+
+  const revoked = await revokeAllSessions(db, {
+    userId: user.id,
+    reason: 'password_changed',
+    correlationId: 'corr-1',
+  })
+  assert.equal(revoked, 2)
+
+  // One per session and not one for the operation: each is a device losing access, and notify
+  // dedupes per session so the user can see how far the compromise reached.
+  const events = await revocationEvents()
+  assert.equal(events.length, 2)
+  assert.deepEqual(
+    events.map((e) => e.key).sort(),
+    [a.sessionId, b.sessionId].sort(),
+  )
+  // `password_changed` is not `signed_out`, so notify alerts on it. That is the 04-domain-model
+  // 10.3 case word for word.
+  assert.ok(events.every((e) => e.payload['reason'] === 'password_changed'))
+})
+
+test('the stolen-token family burn announces itself to the victim', { skip }, async () => {
+  // THE CASE notify's critical rule EXISTS FOR, and the one that announced nothing at all. A
+  // replayed refresh token burns the family and signs the real user out of a device; until this
+  // emit, that was visible in an operator log and nowhere the user could see it.
+  const { refreshToken, sessionId, user } = await open()
+  const rotated = await rotateRefreshToken(db, refreshToken, 'corr-1')
+  assert.ok(rotated.status === 'ok')
+
+  // Replayed outside the grace window — a genuine reuse, not two tabs.
+  await sql`update refresh_tokens set rotated_at = now() - interval '1 hour' where session_id = ${sessionId}`
+  const replay = await rotateRefreshToken(db, refreshToken, 'corr-2')
+  assert.equal(replay.status, 'reuse')
+
+  const events = await revocationEvents()
+  assert.equal(events.length, 1, 'the burn must tell the user')
+  assert.equal(events[0]?.key, sessionId)
+  assert.equal(events[0]?.payload['userId'], user.id)
+  // NOT `signed_out` — this is the one reason that is unambiguously an attack, and the reason
+  // string is what decides whether notify raises a critical alert or stays quiet.
+  assert.equal(events[0]?.payload['reason'], 'refresh_reuse_detected')
+})
+
 /* ------------------------------------------------------------------ rotation */
 
 test('rotation issues a successor in the same family and revokes the presented row', { skip }, async () => {
   const { user, sessionId, refreshToken } = await open()
 
-  const rotated = await rotateRefreshToken(db, refreshToken)
+  const rotated = await rotateRefreshToken(db, refreshToken, 'test-correlation')
   assert.equal(rotated.status, 'ok')
   assert.ok(rotated.status === 'ok')
   assert.equal(rotated.userId, user.id)
@@ -184,8 +278,8 @@ test('two tabs refreshing at the same instant both succeed, and the family survi
   const { user, sessionId, refreshToken } = await open()
 
   const [a, b] = await Promise.all([
-    rotateRefreshToken(db, refreshToken),
-    rotateRefreshToken(db, refreshToken),
+    rotateRefreshToken(db, refreshToken, 'test-correlation'),
+    rotateRefreshToken(db, refreshToken, 'test-correlation'),
   ])
 
   assert.equal(a.status, 'ok', 'the first tab must work')
@@ -204,8 +298,8 @@ test('two tabs refreshing at the same instant both succeed, and the family survi
   assert.equal(session[0]!.status, 'active')
 
   // And both successors still work, which is the thing the user actually experiences.
-  assert.equal((await rotateRefreshToken(db, a.refreshToken)).status, 'ok')
-  assert.equal((await rotateRefreshToken(db, b.refreshToken)).status, 'ok')
+  assert.equal((await rotateRefreshToken(db, a.refreshToken, 'test-correlation')).status, 'ok')
+  assert.equal((await rotateRefreshToken(db, b.refreshToken, 'test-correlation')).status, 'ok')
 })
 
 /**
@@ -218,7 +312,7 @@ test('two tabs refreshing at the same instant both succeed, and the family survi
 test('a genuinely replayed token burns the family and revokes the session', { skip }, async () => {
   const { user, sessionId, refreshToken } = await open()
 
-  const rotated = await rotateRefreshToken(db, refreshToken)
+  const rotated = await rotateRefreshToken(db, refreshToken, 'test-correlation')
   assert.ok(rotated.status === 'ok')
 
   // Age the rotation past the grace window. Nothing else changes — this is the same token, the same
@@ -228,7 +322,7 @@ test('a genuinely replayed token burns the family and revokes the session', { sk
      where rotated_at is not null
   `
 
-  const replay = await rotateRefreshToken(db, refreshToken)
+  const replay = await rotateRefreshToken(db, refreshToken, 'test-correlation')
   assert.equal(replay.status, 'reuse')
   assert.ok(replay.status === 'reuse')
   assert.equal(replay.sessionId, sessionId)
@@ -247,7 +341,7 @@ test('a genuinely replayed token burns the family and revokes the session', { sk
 
   // The successor the victim was holding is dead too. That is the containment: whoever has either
   // token is signed out, and the real user notices.
-  assert.equal((await rotateRefreshToken(db, rotated.refreshToken)).status, 'invalid')
+  assert.equal((await rotateRefreshToken(db, rotated.refreshToken, 'test-correlation')).status, 'invalid')
 })
 
 /**
@@ -259,13 +353,13 @@ test('a genuinely replayed token burns the family and revokes the session', { sk
  */
 test('a family that has ended cannot be reopened by a grace-eligible token', { skip }, async () => {
   const { user, sessionId, refreshToken } = await open()
-  const first = await rotateRefreshToken(db, refreshToken)
+  const first = await rotateRefreshToken(db, refreshToken, 'test-correlation')
   assert.ok(first.status === 'ok')
 
-  await revokeSession(db, user.id, sessionId, 'signed_out')
+  await revokeSession(db, user.id, sessionId, 'signed_out', 'test-correlation')
 
   // Presented inside the grace window, against a family that is over.
-  const graced = await rotateRefreshToken(db, refreshToken)
+  const graced = await rotateRefreshToken(db, refreshToken, 'test-correlation')
   assert.notEqual(graced.status, 'ok', 'a token must never be minted into an ended family')
   const live = await sql<{ id: string }[]>`
     select id from refresh_tokens where user_id = ${user.id} and revoked = false
@@ -286,20 +380,20 @@ test('a family that has ended cannot be reopened by a grace-eligible token', { s
  */
 test('a token from a session that was signed out is invalid, and raises no theft alert', { skip }, async () => {
   const { user, sessionId, refreshToken } = await open()
-  await revokeSession(db, user.id, sessionId, 'signed_out')
+  await revokeSession(db, user.id, sessionId, 'signed_out', 'test-correlation')
 
-  assert.equal((await rotateRefreshToken(db, refreshToken)).status, 'invalid')
+  assert.equal((await rotateRefreshToken(db, refreshToken, 'test-correlation')).status, 'invalid')
   // Twice, because a retrying client presents it more than once and each one must be as quiet.
-  assert.equal((await rotateRefreshToken(db, refreshToken)).status, 'invalid')
+  assert.equal((await rotateRefreshToken(db, refreshToken, 'test-correlation')).status, 'invalid')
   assert.ok(user.id)
 })
 
 test('an unknown or expired token is invalid, and burns nothing', { skip }, async () => {
   const { user, refreshToken } = await open()
-  assert.equal((await rotateRefreshToken(db, 'f'.repeat(64))).status, 'invalid')
+  assert.equal((await rotateRefreshToken(db, 'f'.repeat(64), 'test-correlation')).status, 'invalid')
 
   await sql`update refresh_tokens set expires_at = now() - interval '1 day' where user_id = ${user.id}`
-  assert.equal((await rotateRefreshToken(db, refreshToken)).status, 'invalid')
+  assert.equal((await rotateRefreshToken(db, refreshToken, 'test-correlation')).status, 'invalid')
 })
 
 /* ------------------------------------------------------------------ ending a session */
@@ -310,15 +404,15 @@ test('signing out ends the FAMILY, not the one token the client happened to hold
   // and reachable by no further user action.
   const { user, refreshToken } = await open()
   const [a, b] = await Promise.all([
-    rotateRefreshToken(db, refreshToken),
-    rotateRefreshToken(db, refreshToken),
+    rotateRefreshToken(db, refreshToken, 'test-correlation'),
+    rotateRefreshToken(db, refreshToken, 'test-correlation'),
   ])
   assert.ok(a.status === 'ok' && b.status === 'ok')
 
-  await revokeSessionByToken(db, a.refreshToken)
+  await revokeSessionByToken(db, a.refreshToken, 'test-correlation')
 
-  assert.equal((await rotateRefreshToken(db, a.refreshToken)).status, 'invalid')
-  assert.equal((await rotateRefreshToken(db, b.refreshToken)).status, 'invalid', 'the sibling must die too')
+  assert.equal((await rotateRefreshToken(db, a.refreshToken, 'test-correlation')).status, 'invalid')
+  assert.equal((await rotateRefreshToken(db, b.refreshToken, 'test-correlation')).status, 'invalid', 'the sibling must die too')
   assert.equal((await listSessions(db, user.id)).length, 0)
 })
 
@@ -333,13 +427,13 @@ test('sign out everywhere ends every session, and can spare exactly one', { skip
   })
 
   // The password-change shape: the session that just proved it knows the password survives.
-  const revoked = await revokeAllSessions(db, user.id, 'password_changed', b.sessionId)
+  const revoked = await revokeAllSessions(db, { userId: user.id, reason: 'password_changed', correlationId: 't', keepSessionId: b.sessionId })
   assert.equal(revoked, 1)
-  assert.equal((await rotateRefreshToken(db, a.refreshToken)).status, 'invalid')
-  assert.equal((await rotateRefreshToken(db, b.refreshToken)).status, 'ok', 'the kept session keeps working')
+  assert.equal((await rotateRefreshToken(db, a.refreshToken, 'test-correlation')).status, 'invalid')
+  assert.equal((await rotateRefreshToken(db, b.refreshToken, 'test-correlation')).status, 'ok', 'the kept session keeps working')
 
   // And with nothing spared, everything goes.
-  await revokeAllSessions(db, user.id, 'signed_out_everywhere')
+  await revokeAllSessions(db, { userId: user.id, reason: 'signed_out_everywhere', correlationId: 't' })
   assert.equal((await listSessions(db, user.id)).length, 0)
 })
 
@@ -349,7 +443,7 @@ test('a refresh against a revoked session is refused even with a live token row'
   // operation the user pressed would be advisory.
   const { user, sessionId, refreshToken } = await open()
   await sql`update sessions set status = 'revoked', revoked_at = now() where id = ${sessionId}`
-  assert.equal((await rotateRefreshToken(db, refreshToken)).status, 'invalid')
+  assert.equal((await rotateRefreshToken(db, refreshToken, 'test-correlation')).status, 'invalid')
   assert.ok(user.id)
 })
 

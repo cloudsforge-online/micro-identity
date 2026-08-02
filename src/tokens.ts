@@ -19,7 +19,12 @@ import type { AuthMethod, Claims, Role, Scope, UserClaims } from '@cloudsforge/c
 import { env } from './env.ts'
 import { getSigningKey, getVerificationKey } from './keys.ts'
 import { uuidv7 } from './ids.ts'
-import type { Db, Tx } from './outbox.ts'
+import { withOutbox, type Db, type Tx } from './outbox.ts'
+// sessions.ts imports `insertRefreshToken` from here, so this is a cycle. It is safe and
+// deliberate: both sides are hoisted `function` declarations used only at call time, never at
+// module-evaluation time. The alternative — spelling the emit out a second time — would give one
+// topic two payload shapes to drift apart, which is the defect `identity.mfa.changed` already was.
+import { emitSessionRevoked } from './sessions.ts'
 
 /** SD-01. Fifteen minutes: long enough that refreshes are rare, short enough that theft expires. */
 export const ACCESS_TTL_SECONDS = 15 * 60
@@ -224,7 +229,11 @@ interface SpentRow {
  * password change or by an earlier family burn has none, and presenting it burns the family exactly
  * as before.
  */
-export async function rotateRefreshToken(sql: Db, token: string): Promise<RotateResult> {
+export async function rotateRefreshToken(
+  sql: Db,
+  token: string,
+  correlationId: string,
+): Promise<RotateResult> {
   const tokenHash = hashToken(token)
   // One clock for the whole call — the expiry test, the rotation stamp and the grace test have to
   // agree, and `Date.now()` read three times cannot disagree by much but can disagree at exactly
@@ -310,8 +319,7 @@ export async function rotateRefreshToken(sql: Db, token: string): Promise<Rotate
    * `hashtext()` collides across families roughly once in four billion, and a collision costs one
    * caller a wait, not a wrong answer. The transaction form releases it on commit or rollback, so a
    * throw here cannot wedge a family. */
-  return sql
-    .begin(async (tx) => {
+  return withOutbox(sql, 'identity', async (tx, emit) => {
       await tx`select pg_advisory_xact_lock(hashtext(${spent.family_id})::bigint)`
 
       /* A SESSION THAT IS ALREADY OVER IS NOT A THEFT REPORT.
@@ -330,7 +338,7 @@ export async function rotateRefreshToken(sql: Db, token: string): Promise<Rotate
       const session = await tx<{ status: string }[]>`
         select status from sessions where id = ${spent.session_id}
       `
-      if (session[0]?.status !== 'active') return { result: { status: 'invalid' } as RotateResult }
+      if (session[0]?.status !== 'active') return { status: 'invalid' } as RotateResult
 
       const rotatedAt = spent.rotated_at
       if (rotatedAt && now.getTime() - rotatedAt.getTime() <= ROTATION_GRACE_MS) {
@@ -363,14 +371,12 @@ export async function rotateRefreshToken(sql: Db, token: string): Promise<Rotate
           })
           await tx`update sessions set last_active_at = ${now} where id = ${spent.session_id}`
           return {
-            result: {
-              status: 'ok',
-              userId: spent.user_id,
-              sessionId: spent.session_id,
-              refreshToken,
-              concurrent: true,
-            } as RotateResult,
-          }
+            status: 'ok',
+            userId: spent.user_id,
+            sessionId: spent.session_id,
+            refreshToken,
+            concurrent: true,
+          } as RotateResult
         }
       }
 
@@ -386,11 +392,23 @@ export async function rotateRefreshToken(sql: Db, token: string): Promise<Rotate
            set status = 'revoked', revoked_at = ${now}, revoke_reason = 'refresh_reuse_detected'
          where id = ${spent.session_id} and status = 'active'
       `
-      return {
-        result: { status: 'reuse', userId: spent.user_id, sessionId: spent.session_id } as RotateResult,
-      }
+      /* THE EVENT THAT TELLS THE VICTIM. This is the case notify's critical rule on
+       * `identity.session.revoked` exists for: a stolen refresh token was replayed, the family was
+       * burned, and the person whose account it is has just been signed out of a device by
+       * somebody else. Of the reasons this service revokes a session for, this is the only one
+       * that is unambiguously an attack, and until now it announced nothing — the burn was visible
+       * in an operator log and nowhere the user could see it.
+       *
+       * In the same transaction as the burn, so a crash cannot contain the theft and lose the
+       * warning about it. */
+      emitSessionRevoked(emit, {
+        sessionId: spent.session_id,
+        userId: spent.user_id,
+        reason: 'refresh_reuse_detected',
+        correlationId,
+      })
+      return { status: 'reuse', userId: spent.user_id, sessionId: spent.session_id } as RotateResult
     })
-    .then((outcome) => outcome.result)
 }
 
 export type VerifyFailureReason =

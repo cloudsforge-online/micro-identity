@@ -105,6 +105,98 @@ export const AWAITING_REGISTRATION: Readonly<Record<string, ProposedTopic>> = Ob
   // registry now instead of by a proposal here.
 })
 
+/**
+ * Exported functions that emit, and that nothing calls.
+ *
+ * ## The hole this closes, which the checks above could not see
+ *
+ * Everything else in this file reconciles topic NAMES: the literals in `src/` against the registry,
+ * in both directions. That is a check on spelling and on membership, and it is blind to the one
+ * question that decides whether a fact ever reaches the bus — **is the code containing that literal
+ * ever executed?**
+ *
+ * It was blind to it in production. `emitSessionRevoked` was written, correct, and called by
+ * nothing: `revokeSession` and `revokeAllSessions` updated the session rows and emitted nothing at
+ * all. Every check above passed, because the literal `identity.session.revoked` was present in
+ * `src/` exactly as the registry spells it. Meanwhile `micro-notify` had landed a **critical** rule
+ * on that topic — the one that tells a user their session was killed by a security event rather
+ * than by their own sign-out — and it could never fire. A topic whose producer is unreachable is
+ * indistinguishable, from the registry's point of view, from one that works.
+ *
+ * That is the same class of defect as `identity.user.registered`, which the registry named and all
+ * three consumers classified while the producer never emitted it. The difference is only that this
+ * one had an emitter, so a name-based check saw what it expected to see.
+ *
+ * ## What "reachable" means here, and what it deliberately does not
+ *
+ * An exported function whose body contains a `topic: '...'` literal must be referenced by name
+ * somewhere in `src/` other than its own declaration. That is a cheap, purely syntactic proxy for
+ * reachability and it is honest about being one:
+ *
+ *   - It catches the whole of the defect that actually happened — an emitter nothing calls.
+ *   - It does NOT prove the caller is itself reachable, or that the branch containing the call is
+ *     ever taken. A chain of dead functions calling each other would satisfy it.
+ *
+ * A real answer needs a call graph from the type checker, which is a great deal of machinery for a
+ * service with eight emit sites. This is the ninety-percent check that costs twenty lines, and the
+ * limitation is written down here rather than left for someone to discover.
+ */
+export function unreferencedEmitters(
+  sources: ReadonlyArray<{ readonly file: string; readonly text: string }>,
+): readonly string[] {
+  const declaration = /^export\s+(?:async\s+)?function\s+(\w+)/gm
+  const emitters: { name: string; file: string }[] = []
+
+  /*
+   * COMMENTS ARE STRIPPED FIRST, and finding out why is instructive: the first version of this
+   * check passed while `emitSessionRevoked` still had no caller, because the paragraphs above
+   * mention it by name and a prose mention counted as a reference. A guard that a comment about
+   * the guard can satisfy is worse than no guard, because it reads as a proof.
+   *
+   * The same line-shape rule `emittedInSource` uses in topics.test.ts, for the same reason.
+   */
+  const code = sources.map((source) => ({
+    file: source.file,
+    text: source.text
+      .split('\n')
+      .map((line) => {
+        const trimmed = line.trimStart()
+        if (trimmed.startsWith('*') || trimmed.startsWith('//') || trimmed.startsWith('/*')) return ''
+        return line.replace(/\/\/.*$/, '')
+      })
+      .join('\n'),
+  }))
+
+  for (const source of code) {
+    for (const match of source.text.matchAll(declaration)) {
+      const name = match[1]
+      if (!name || match.index === undefined) continue
+      // The body runs to the next closing brace in column zero, which is where this codebase puts
+      // the end of every top-level function.
+      const rest = source.text.slice(match.index)
+      const end = rest.search(/\n\}/)
+      const body = end === -1 ? rest : rest.slice(0, end)
+      if (/\btopic:\s*'/.test(body)) emitters.push({ name, file: source.file })
+    }
+  }
+
+  const unreferenced: string[] = []
+  for (const emitter of emitters) {
+    let references = 0
+    for (const source of code) {
+      for (const hit of source.text.matchAll(new RegExp(`\\b${emitter.name}\\b`, 'g'))) {
+        // Its own `export function <name>` is not a call site. Every other mention — an import, a
+        // call, a re-export — is something that could lead here.
+        const preceding = source.text.slice(Math.max(0, hit.index - 40), hit.index)
+        if (source.file === emitter.file && /function\s+$/.test(preceding)) continue
+        references += 1
+      }
+    }
+    if (references === 0) unreferenced.push(`${emitter.name} (${emitter.file})`)
+  }
+  return unreferenced.sort()
+}
+
 /** Topics identity emits that no registry names and no proposal explains — always a defect. */
 export function undeclaredTopics(emitted: readonly string[]): readonly string[] {
   return emitted

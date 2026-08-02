@@ -886,7 +886,7 @@ function buildRoutes(): Route[] {
       const body = await readJson(ctx.req)
       const presented = requireString(body, 'refreshToken')
 
-      const rotated = await rotateRefreshToken(deps.sql, presented)
+      const rotated = await rotateRefreshToken(deps.sql, presented, ctx.requestId)
       if (rotated.status === 'reuse') {
         deps.metrics.increment('identity_refresh_reuse_total')
         ctx.log.warn('refresh token reuse detected — family and session revoked', {
@@ -925,7 +925,7 @@ function buildRoutes(): Route[] {
 
     define('POST', '/auth/logout', async (ctx, deps) => {
       const body = await readJson(ctx.req)
-      await revokeSessionByToken(deps.sql, requireString(body, 'refreshToken'))
+      await revokeSessionByToken(deps.sql, requireString(body, 'refreshToken'), ctx.requestId)
       return { status: 204 }
     }),
 
@@ -990,7 +990,7 @@ function buildRoutes(): Route[] {
       // Everything the old password could still reach dies with it: every session, and any reset
       // link that was issued and never used. The caller's own session survives, because the person
       // who just proved they know the password is the one who should stay signed in.
-      const revoked = await revokeAllSessions(deps.sql, user.id, 'password_changed', claims.sid)
+      const revoked = await revokeAllSessions(deps.sql, { userId: user.id, reason: 'password_changed', correlationId: ctx.requestId, keepSessionId: claims.sid })
       await revokePasswordResetTokens(deps.sql, user.id)
       ctx.log.info('password changed', { audit: 'password_change', userId: user.id, revoked })
       return { status: 200, body: { sessionsRevoked: revoked } }
@@ -1062,7 +1062,7 @@ function buildRoutes(): Route[] {
       await setPassword(deps.sql, user.id, checked.value)
       // SD-04: spending a reset revokes every refresh family. No session is kept — whoever forced
       // the reset must not survive it, and the real owner is about to sign in anyway.
-      const revoked = await revokeAllSessions(deps.sql, user.id, 'password_reset')
+      const revoked = await revokeAllSessions(deps.sql, { userId: user.id, reason: 'password_reset', correlationId: ctx.requestId })
       await revokePasswordResetTokens(deps.sql, user.id)
       // Whoever is resetting almost certainly got here by failing to sign in, so leaving the
       // lock-out in place would hand them a password they cannot use for another fifteen minutes.
@@ -1125,7 +1125,7 @@ function buildRoutes(): Route[] {
       // Sign out everywhere INCLUDING here. A "sign out everywhere" that spares the button that was
       // pressed is not the operation the user asked for — they pressed it because they believe a
       // session is compromised, and the one they are looking at may be it.
-      const revoked = await revokeAllSessions(deps.sql, claims.sub, 'signed_out_everywhere')
+      const revoked = await revokeAllSessions(deps.sql, { userId: claims.sub, reason: 'signed_out_everywhere', correlationId: ctx.requestId })
       ctx.log.info('signed out everywhere', { audit: 'sessions_revoked', userId: claims.sub, revoked })
       return { status: 200, body: { revoked } }
     }),
@@ -1134,7 +1134,7 @@ function buildRoutes(): Route[] {
       const claims = await authenticateUser(ctx, deps)
       const id = ctx.params['id'] ?? ''
       if (!isUuid(id)) throw new BadRequestError('that is not a session id')
-      await revokeSession(deps.sql, claims.sub, id, 'signed_out')
+      await revokeSession(deps.sql, claims.sub, id, 'signed_out', ctx.requestId)
       // 204 whether or not there was one. Signing out of something already signed out is not an
       // error, and a 404 here would say which session ids exist.
       return { status: 204 }

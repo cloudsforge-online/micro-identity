@@ -27,9 +27,17 @@ import {
   malformedProposals,
   undeclaredTopics,
   unemittedOwnedTopics,
+  unreferencedEmitters,
 } from './topics.ts'
 
 const SRC = dirname(fileURLToPath(import.meta.url))
+
+/** Every non-test source file, as text. The reachability check needs whole files, not lines. */
+function sourceFiles(): ReadonlyArray<{ file: string; text: string }> {
+  return readdirSync(SRC)
+    .filter((f) => f.endsWith('.ts') && !f.endsWith('.test.ts') && f !== 'testsupport.ts')
+    .map((file) => ({ file, text: readFileSync(join(SRC, file), 'utf8') }))
+}
 
 /**
  * Every topic literal that appears at an emit site in this service.
@@ -90,6 +98,23 @@ test('every registry topic identity owns is actually emitted', () => {
   // And the registry is being read rather than the check passing vacuously.
   assert.ok(topicsProducedBy('identity').length >= 5)
   assert.ok(TOPIC_NAMES.length >= 18)
+})
+
+test('every emitter is actually called by something', () => {
+  // THE REACHABILITY DIRECTION, and the one the other three checks are blind to. They reconcile
+  // topic NAMES; a name is present in src/ whether or not the code containing it can ever run.
+  //
+  // `emitSessionRevoked` was correct, spelled exactly as the registry spells it, and called by
+  // nothing — so every check above passed while notify's critical rule on the topic could never
+  // fire. Spelling a topic right proves nothing about whether it is ever produced.
+  assert.deepEqual(
+    unreferencedEmitters(sourceFiles()),
+    [],
+    'these functions emit and nothing calls them — every consumer downstream of them is dead code',
+  )
+
+  // And the scan is finding emitters at all rather than passing because it matched none.
+  assert.ok(sourceFiles().length >= 10, 'the source scan found the service')
 })
 
 test('a pending proposal disappears once contracts adopts it', () => {
