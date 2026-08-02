@@ -120,11 +120,18 @@ test('the three topics that were wrong stay fixed', () => {
   assert.ok(emitted.has('identity.mfa.removed'), 'the registered name for a factor being revoked')
   assert.ok(emitted.has('identity.mfa.added'), 'the other half, which notify has always expected')
   assert.equal(isRegisteredTopic('identity.mfa.removed'), true)
+  // contracts has since adopted `added` too (contracts/packages/events/src/index.ts:291), so the
+  // consumer rule notify has carried all along can finally fire.
+  assert.equal(isRegisteredTopic('identity.mfa.added'), true)
 
-  // 2. Session revocation is a real fact and stays emitted, with a proposal explaining itself.
+  // 2. Session revocation is a real fact and stays emitted. It was carried as a proposal here while
+  // micro-contracts belonged to another agent; that agent has now registered it, so the assertion
+  // moves UP from "a proposal explains it" to "the shared registry names it" — and it must no
+  // longer be in the quarantine, or `pendingProposalsNotYetRegistered` would fail.
   assert.ok(emitted.has('identity.session.revoked'))
   assert.ok(emitted.has('identity.session.created'))
-  assert.ok(Object.hasOwn(AWAITING_REGISTRATION, 'identity.session.revoked'))
+  assert.equal(isRegisteredTopic('identity.session.revoked'), true)
+  assert.ok(!Object.hasOwn(AWAITING_REGISTRATION, 'identity.session.revoked'))
 
   // 3. Registration. The registry and all three consumers named it; only the producer did not.
   assert.ok(emitted.has('identity.user.registered'), '"your account was created" starts here')

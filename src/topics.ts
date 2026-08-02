@@ -92,30 +92,17 @@ export interface ProposedTopic {
  * described here instead of registered there.
  */
 export const AWAITING_REGISTRATION: Readonly<Record<string, ProposedTopic>> = Object.freeze({
-  'identity.session.revoked': Object.freeze({
-    reason:
-      'A session ending is not the same fact as a session starting, and only one of the two is on the bus. Sign-out, an admin revoking a session, and the refresh-family burn that follows a stolen token all end here, and today no consumer can tell any of them happened. It is the other half of identity.session.created, which is registered.',
-    spec: Object.freeze({
-      producer: 'identity',
-      payloadType: 'SessionRevoked',
-      version: '1.0',
-      keyedBy: 'session_id',
-      description:
-        'A session was ended, carrying the reason. The other half of identity.session.created.',
-    }),
-  }),
-  'identity.mfa.added': Object.freeze({
-    reason:
-      'notify has carried a rule for this topic since the catalogue was written, and its own AD-08 coverage test lists it as required — so the consumer side already exists and has never been able to fire, because the registry does not name the topic and identity did not emit it. A second factor appearing on an account is 04-domain-model 10.3 security news in its own right: it is how an attacker keeps an account after the password is reset.',
-    spec: Object.freeze({
-      producer: 'identity',
-      payloadType: 'MfaFactorAdded',
-      version: '1.0',
-      keyedBy: 'user_id',
-      description:
-        'A second factor was activated, flagging whether it replaced an existing factor of the same kind.',
-    }),
-  }),
+  // EMPTY, AND THAT IS THE QUARANTINE WORKING RATHER THAN A GAP.
+  //
+  // `identity.session.revoked` and `identity.mfa.added` were both described here because
+  // micro-contracts was owned by another agent at the time. It has since adopted both —
+  // contracts/packages/events/src/index.ts:263 and :291 — so `isRegisteredTopic` now answers true
+  // for each, and the test that asserts every entry is GENUINELY absent from the registry failed
+  // until they were deleted. That is the third property in the doc above doing exactly what it
+  // promised: the quarantine empties itself rather than rotting into a permanent allow-list.
+  //
+  // Nothing else changes. Both topics stay in `EMITTED_TOPICS`; they are simply named by the shared
+  // registry now instead of by a proposal here.
 })
 
 /** Topics identity emits that no registry names and no proposal explains — always a defect. */
