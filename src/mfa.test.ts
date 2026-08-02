@@ -271,17 +271,25 @@ test('a first recovery set replaces nothing, and a second replaces the first', {
   // recovery codes were replaced" — the second is the one that locks out an owner who kept the
   // old set. Nothing asserted it, so nothing stopped it being emitted constant.
   const user = await makeUser()
+
+  // Read back after each call rather than fetching both and ordering. `outbox.id` is
+  // `gen_random_uuid()` — v4, not v7 — so `order by id` is a random order that happened to pass
+  // locally and failed in CI. The relay does not rely on it either: it orders by `occurred_at`.
   await sql`delete from outbox`
-
   await generateRecoveryCodes(db, { userId: user.id, correlationId: 't' })
-  await generateRecoveryCodes(db, { userId: user.id, correlationId: 't' })
-
-  const events = await sql<{ payload: Record<string, unknown> }[]>`
-    select payload from outbox where topic = 'identity.mfa.added' order by id
+  const first = await sql<{ payload: Record<string, unknown> }[]>`
+    select payload from outbox where topic = 'identity.mfa.added'
   `
-  assert.equal(events.length, 2)
-  assert.equal(events[0]!.payload['replacedPrevious'], false)
-  assert.equal(events[1]!.payload['replacedPrevious'], true)
+  assert.equal(first.length, 1)
+  assert.equal(first[0]!.payload['replacedPrevious'], false)
+
+  await sql`delete from outbox`
+  await generateRecoveryCodes(db, { userId: user.id, correlationId: 't' })
+  const second = await sql<{ payload: Record<string, unknown> }[]>`
+    select payload from outbox where topic = 'identity.mfa.added'
+  `
+  assert.equal(second.length, 1)
+  assert.equal(second[0]!.payload['replacedPrevious'], true)
 })
 
 /* ------------------------------------------------------------------ the last-factor rule */
