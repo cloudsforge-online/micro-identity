@@ -19,7 +19,7 @@ import { normaliseEmail, normaliseHandle, type Organisation, type PublicUser, ty
 import { uuidv7 } from './ids.ts'
 import { CURRENT_ALGO, hashPassword, needsRehash, verifyPassword } from './passwords.ts'
 import { createPersonalOrganisation } from './organisations.ts'
-import type { Db, Tx } from './outbox.ts'
+import { withOutbox, type Db, type Tx } from './outbox.ts'
 
 /** The email or the handle is already taken. Answered 409, and never says which. */
 export class ConflictError extends Error {
@@ -88,8 +88,37 @@ export interface Registered {
  * rendering as a 500 rather than the 409 twelve lines above it. The unique indexes are the only
  * thing that actually decides, so this asks them directly and maps 23505. One round trip fewer, and
  * one fewer place for the two answers to disagree.
+ *
+ * ## `identity.user.registered`
+ *
+ * The registry has declared this topic since the registry existed. `notify` renders it as
+ * `account.registered` — "the first thing the platform ever says to someone". `activity` files it
+ * as `account.registered` with the summary "Your account was created." `analytics` counts it as
+ * `user_registered`, the denominator of every onboarding cohort.
+ *
+ * **None of that had ever run, because this function never emitted the event.** The route logged
+ * `audit: 'user_registered'` and that line is what a reader kept finding when they went looking for
+ * the emit, which is most of why the gap survived: there was something at the end of the grep with
+ * the right words in it. A log line is not a fact leaving the service. Three consumers were holding
+ * code for a message that was never sent.
+ *
+ * It is emitted through `withOutbox` rather than after the commit, and the transaction now covers
+ * the user, the profile, the personal organisation **and** the event. Rule 5 of docs/ecosystem/03
+ * §2 asks for exactly that, and here it is load-bearing rather than ceremonial: the description the
+ * registry gives this topic is "An account exists, with its personal organisation already created",
+ * so an event published after a commit that got as far as the user row and no further would be a
+ * statement the registry says is true and the database says is not.
  */
-export async function registerUser(sql: Db, input: RegisterInput): Promise<Registered> {
+export async function registerUser(
+  sql: Db,
+  input: RegisterInput,
+  /**
+   * Optional so the tests and the operator tool can call this with two arguments, and passed by
+   * the route so the registration event, the session event and the device event that a sign-up
+   * produces all carry the one request id that caused them.
+   */
+  correlationId?: string,
+): Promise<Registered> {
   // Normalised again here rather than trusted from the caller. This function is reachable from a
   // route, a test and an operator tool, and "the caller normalised it" is an assumption that holds
   // until the day somebody adds a fourth caller.
@@ -99,7 +128,7 @@ export async function registerUser(sql: Db, input: RegisterInput): Promise<Regis
   const id = uuidv7()
 
   try {
-    const outcome = await sql.begin(async (tx) => {
+    return await withOutbox(sql, 'identity', async (tx, emit) => {
       const rows = await tx<UserRow[]>`
         insert into users (id, email, handle, handle_key, password_hash, hash_algo, roles)
         values (${id}, ${email}, ${input.handle}, ${handleKey}, ${hash}, ${algo}, ${['player']})
@@ -109,9 +138,29 @@ export async function registerUser(sql: Db, input: RegisterInput): Promise<Regis
       const user = rows[0]!
       await tx`insert into profiles (user_id, display_name) values (${id}, ${input.handle})`
       const organisation = await createPersonalOrganisation(tx, { userId: id, handle: input.handle })
+      emit({
+        topic: 'identity.user.registered',
+        // The registry pins `keyedBy: user_id`, and `activity` reads the owner straight off the
+        // key for this topic. Keying it by anything else would file every registration in nobody's
+        // feed — the exact defect that `identity.session.created` was found to have, where a
+        // session id in the key position queried as cleanly as a user id and matched no one.
+        key: id,
+        payload: {
+          userId: id,
+          // `handle`, not the display name: notify's template greets the user by it, and the
+          // display name is a profile field a user can change to something the greeting should
+          // not have been built on.
+          handle: input.handle,
+          organisationId: organisation.id,
+          organisationSlug: organisation.slug,
+        },
+        // The account acts for itself. There is no operator or service behind a self-service
+        // registration, and `system` would lose the one attribution that is available.
+        actor: `user:${id}`,
+        ...(correlationId === undefined ? {} : { correlationId }),
+      })
       return { user, organisation }
     })
-    return outcome
   } catch (err) {
     // 23505 is unique_violation. Both indexes — `users_email_lower_uniq` and `users_handle_key_uniq`
     // — land here, and the answer does not say which: distinguishing them would turn registration

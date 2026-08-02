@@ -105,6 +105,63 @@ test('registration writes the user, the profile and a personal organisation atom
 })
 
 /**
+ * **`identity.user.registered` had never once been emitted.**
+ *
+ * The registry declares the topic. `notify` renders it as the first thing the platform ever says
+ * to someone, `activity` files it as "Your account was created." and `analytics` counts it as the
+ * denominator of every onboarding cohort. All three were holding code for a message no producer
+ * ever sent, and the only thing at the end of a grep was the route's `audit: 'user_registered'`
+ * log line — which is why it survived: something with the right words in it was always found.
+ *
+ * The event is asserted to be in the outbox in the same transaction as the account, because that
+ * is what makes the registry's description of it ("an account exists, with its personal
+ * organisation already created") true rather than merely intended.
+ */
+test('registration puts identity.user.registered on the bus, keyed by the user', { skip }, async () => {
+  const handle = freshHandle()
+  await sql`delete from outbox`
+
+  const { user, organisation } = await registerUser(db, {
+    email: freshEmail(),
+    handle,
+    handleKey: normaliseHandle(handle),
+    password: GOOD_PASSWORD,
+  })
+
+  const events = await sql<{ topic: string; key: string; payload: Record<string, unknown> }[]>`
+    select topic, key, payload from outbox where topic = 'identity.user.registered'
+  `
+  assert.equal(events.length, 1, 'three services classify this topic and nothing emitted it')
+  // Keyed by the user. `activity` reads the owner straight off the key for this topic, so any
+  // other key files every registration in nobody's feed.
+  assert.equal(events[0]!.key, user.id)
+  assert.equal(events[0]!.payload['userId'], user.id)
+  // notify's template greets the user by handle, not by the profile display name — which is a
+  // field a user can later change to something the greeting should not have been built on.
+  assert.equal(events[0]!.payload['handle'], handle)
+  // The organisation is named on the event because the registry's description promises it exists
+  // by the time anyone reads this.
+  assert.equal(events[0]!.payload['organisationId'], organisation.id)
+  assert.equal(events[0]!.payload['organisationSlug'], organisation.slug)
+})
+
+test('a registration that loses the uniqueness race emits nothing', { skip }, async () => {
+  // The event is written inside the transaction, so a conflict must take it with it. An outbox
+  // row for an account that does not exist would have every consumer create a user that never
+  // registered — the exact failure the same-transaction rule exists to prevent.
+  const handle = freshHandle()
+  const email = freshEmail()
+  const input = { email, handle, handleKey: normaliseHandle(handle), password: GOOD_PASSWORD }
+  await registerUser(db, input)
+  await sql`delete from outbox`
+
+  await assert.rejects(registerUser(db, input), ConflictError)
+
+  const events = await sql`select 1 from outbox where topic = 'identity.user.registered'`
+  assert.equal(events.length, 0)
+})
+
+/**
  * **The live defect this service closes.**
  *
  * Nimbus matches the address verbatim on register and login but `lower(email)` on forgot-password,

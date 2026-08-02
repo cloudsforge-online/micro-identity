@@ -246,12 +246,42 @@ test('regenerating a recovery set emits a critical event', { skip }, async () =>
   const user = await makeUser()
   await sql`delete from outbox`
   await generateRecoveryCodes(db, { userId: user.id, correlationId: 't' })
+  // `identity.mfa.added`, not the `identity.mfa.changed` this once asserted. Minting a new set
+  // revokes the standing recovery-code factor and inserts a replacement, which is the same shape
+  // as re-enrolling TOTP; `replacedPrevious` carries the distinction. The old name was on no
+  // registry and in no consumer, so every one of these events was delivered and discarded.
   const events = await sql<{ topic: string; payload: Record<string, unknown> }[]>`
-    select topic, payload from outbox where topic = 'identity.mfa.changed'
+    select topic, payload from outbox where topic = 'identity.mfa.added'
   `
   assert.equal(events.length, 1)
-  assert.equal(events[0]!.payload['change'], 'recovery_codes_regenerated')
+  assert.equal(events[0]!.payload['kind'], 'recovery_code')
+  // The one `identity.mfa.added` that is critical: an attacker who regenerates the codes has
+  // locked the owner out of their recovery path, and criticality is therefore a payload field
+  // rather than a property of the topic.
   assert.equal(events[0]!.payload['critical'], true)
+  assert.equal(
+    await sql`select 1 from outbox where topic = 'identity.mfa.changed'`.then((r) => r.length),
+    0,
+    'identity.mfa.changed is a topic no consumer in the estate classifies',
+  )
+})
+
+test('a first recovery set replaces nothing, and a second replaces the first', { skip }, async () => {
+  // `replacedPrevious` is what lets a consumer tell "you now have recovery codes" from "your
+  // recovery codes were replaced" — the second is the one that locks out an owner who kept the
+  // old set. Nothing asserted it, so nothing stopped it being emitted constant.
+  const user = await makeUser()
+  await sql`delete from outbox`
+
+  await generateRecoveryCodes(db, { userId: user.id, correlationId: 't' })
+  await generateRecoveryCodes(db, { userId: user.id, correlationId: 't' })
+
+  const events = await sql<{ payload: Record<string, unknown> }[]>`
+    select payload from outbox where topic = 'identity.mfa.added' order by id
+  `
+  assert.equal(events.length, 2)
+  assert.equal(events[0]!.payload['replacedPrevious'], false)
+  assert.equal(events[1]!.payload['replacedPrevious'], true)
 })
 
 /* ------------------------------------------------------------------ the last-factor rule */
@@ -305,17 +335,68 @@ test('removing the last active factor with re-authentication emits a CRITICAL ev
   assert.equal(await hasActiveFactor(db, user.id), false)
 
   const events = await sql<{ topic: string; key: string; payload: Record<string, unknown> }[]>`
-    select topic, key, payload from outbox where topic = 'identity.mfa.changed'
+    select topic, key, payload from outbox where topic = 'identity.mfa.removed'
   `
   assert.equal(events.length, 1)
-  assert.equal(events[0]!.payload['change'], 'last_factor_removed')
+  // `wasLast`, which is the field `activity` branches on to say "your account is no longer
+  // protected by a second factor" and `notify` reads for the remaining-factor count. It used to
+  // be encoded as `change: 'last_factor_removed'` — a spelling no consumer looked for, on a topic
+  // no consumer subscribed to, so the sentence could never be rendered.
+  assert.equal(events[0]!.payload['wasLast'], true)
+  assert.equal(events[0]!.payload['remainingActive'], 0)
   // 10.3: a critical security notification ignores preferences and always sends. Dropping to
   // password-only is exactly the change a user must be told about even if they have muted
   // everything, because the person who did it may not be them.
   assert.equal(events[0]!.payload['critical'], true)
-  // Keyed on the user, not the factor: ordering is per (topic, key), so "enrolled then removed"
-  // must not be reorderable by a consumer into "removed then enrolled".
+  // Keyed on the user, which is what the registry pins for this topic as `keyedBy: user_id`. The
+  // key is the ordering partition, so it is contract rather than a producer's private choice.
   assert.equal(events[0]!.key, user.id)
+})
+
+test('removing an ordinary factor reports what is left, and is not critical', { skip }, async () => {
+  // The non-last removal had no event assertion at all, so the payload a consumer renders for the
+  // ordinary case — much the commoner one — was never checked.
+  const user = await makeUser()
+  const totpFactor = await enrolAndActivate(user)
+  await generateRecoveryCodes(db, { userId: user.id, correlationId: 't' })
+  await sql`delete from outbox`
+
+  await removeFactor(db, {
+    userId: user.id,
+    factorId: totpFactor.factorId,
+    reauthenticated: false,
+    correlationId: 't',
+  })
+
+  const events = await sql<{ payload: Record<string, unknown> }[]>`
+    select payload from outbox where topic = 'identity.mfa.removed'
+  `
+  assert.equal(events.length, 1)
+  assert.equal(events[0]!.payload['wasLast'], false)
+  assert.equal(events[0]!.payload['remainingActive'], 1)
+  assert.equal(events[0]!.payload['kind'], 'totp')
+  // Not critical: the account still has a second factor, and 10.3's list is the set of changes
+  // that make an account easier to take over.
+  assert.equal(events[0]!.payload['critical'], false)
+})
+
+test('activating a factor emits identity.mfa.added, and enrolment is not critical', { skip }, async () => {
+  // Enrolment emitted `identity.mfa.changed` with `change: 'enrolled'`. notify has carried a rule
+  // for `identity.mfa.added` since its catalogue was written and has never once been able to fire
+  // it, because no producer emitted the name and no registry declared it.
+  const user = await makeUser()
+  await sql`delete from outbox`
+  await enrolAndActivate(user)
+
+  const events = await sql<{ topic: string; key: string; payload: Record<string, unknown> }[]>`
+    select topic, key, payload from outbox where topic = 'identity.mfa.added'
+  `
+  assert.equal(events.length, 1)
+  assert.equal(events[0]!.key, user.id)
+  assert.equal(events[0]!.payload['kind'], 'totp')
+  assert.equal(events[0]!.payload['replacedPrevious'], false)
+  assert.equal(events[0]!.payload['remainingActive'], 1)
+  assert.equal(events[0]!.payload['critical'], false)
 })
 
 test('the classification is asked about the resulting set, so demote and remove cannot diverge', { skip }, async () => {

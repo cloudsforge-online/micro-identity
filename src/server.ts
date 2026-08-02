@@ -660,7 +660,15 @@ function buildRoutes(): Route[] {
 
       const done = deps.lifecycle.track()
       try {
-        const { user, organisation } = await registerUser(deps.sql, validated.value)
+        // The request id is threaded through so the registration, session and device events a
+        // sign-up produces share one correlation id. The `identity.user.registered` event is
+        // emitted inside `registerUser`, in the same transaction as the account — the audit line
+        // below is a log and has never been a substitute for it.
+        const { user, organisation } = await registerUser(
+          deps.sql,
+          validated.value,
+          ctx.requestId,
+        )
         // A fresh account has no factors, so registration completes a session immediately. `amr` is
         // `pwd` and nothing more, which is what lets a later step-up policy tell this session apart
         // from one that presented a second factor.

@@ -366,7 +366,27 @@ export async function revokeSessionByToken(sql: Db, token: string): Promise<void
   await revokeSession(sql, row.user_id, row.session_id, 'signed_out')
 }
 
-/** Emit a session event from inside a caller's transaction. Kept here so the topics live together. */
+/**
+ * Emit a session event from inside a caller's transaction. Kept here so the topics live together.
+ *
+ * **This topic stays, and the registry is what is incomplete.** It was found during a producer/
+ * consumer audit as a topic nothing anywhere classifies, and the tempting repair was to delete it
+ * or fold it into `identity.session.created` with a field. Both are wrong. A session ending is not
+ * the same fact as a session starting, and three different things end one: a deliberate sign-out,
+ * an operator or user revoking a session from the device list, and the refresh-family burn that
+ * fires when a stolen token is replayed outside the grace window. The third is a security event a
+ * user must be able to see, and today nothing downstream can tell it happened at all.
+ *
+ * So the emit is correct and the estate has not caught up with it. `topics.ts` records it in
+ * `AWAITING_REGISTRATION` with the exact `TopicSpec` that `@cloudsforge/contracts-events` needs, and
+ * the guard there fails the moment contracts adopts it and this quarantine is not cleaned up.
+ * Until then the event is written and delivered; what is missing is a consumer allowed to name it,
+ * because `activity` classifies `satisfies Record<TopicName, _>` and cannot reference a topic the
+ * registry has not declared.
+ *
+ * Keyed on the session rather than the user: two revocations of the same session must stay in
+ * order relative to each other, and a revocation has no ordering relationship to anything else.
+ */
 export function emitSessionRevoked(
   emit: Emit,
   input: { sessionId: string; userId: string; reason: string; correlationId: string },

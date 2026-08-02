@@ -16,21 +16,28 @@
  * No broker. Postgres already has transactions and `SKIP LOCKED`, and AD-10 records the four
  * measured conditions under which that stops being true.
  *
- * Taken from the service template unchanged, because it is infrastructure and the estate benefits
- * from one implementation rather than twenty-two. Identity's four topics are the reason it matters
- * more here than in most services:
+ * Taken from the service template, because it is infrastructure and the estate benefits from one
+ * implementation rather than twenty-two. The one divergence is that `DomainEvent.topic` is typed
+ * rather than `string`; see the field. Identity's topics are the reason it matters more here than
+ * in most services — `topics.ts` holds the set and its agreement with the shared registry:
  *
+ *   `identity.user.registered`  — an account exists. Written in the same transaction as the user,
+ *                                 profile and personal organisation, because a registration event
+ *                                 for a half-built account is worse than none.
  *   `identity.user.deleted`     — the GDPR erasure signal. Fourteen databases hold a `user_id`, and
  *                                 every one of them erases on this event. It has to be written in
  *                                 the same transaction as the status change, or a crash between the
  *                                 two leaves a user marked deleted that nothing downstream ever
  *                                 hears about — an erasure that silently did not happen.
  *   `identity.session.created`  — what makes a "new sign-in" notification possible at all.
+ *   `identity.session.revoked`  — the other half: sign-out, admin revocation, and the family burn
+ *                                 that follows a stolen refresh token.
  *   `identity.device.added`     — the critical one. SD-02 and 10.3: a sign-in from a device this
  *                                 account has never used is the signal a user can act on, and it
  *                                 ignores notification preferences.
- *   `identity.mfa.changed`      — enrolment, removal, and recovery-code regeneration. Removing the
- *                                 last active factor emits this with `critical: true`.
+ *   `identity.mfa.added`        — a second factor was activated, or an existing one replaced.
+ *   `identity.mfa.removed`      — a factor was revoked, carrying whether it was the last active
+ *                                 one. That case emits with `critical: true`.
  */
 
 import { EVENT_ID_HEADER, SIGNATURE_HEADER, signDelivery, verifyDelivery } from '@cloudsforge/contracts-events'
@@ -39,14 +46,25 @@ import type { Sql, TransactionSql } from 'postgres'
 import { HttpClient } from '@cloudsforge/http'
 import type { Logger } from '@cloudsforge/telemetry'
 import type { Handler } from '@cloudsforge/jobs'
+import type { IdentityTopic } from './topics.ts'
 
 export type Db = Sql
 export type Tx = TransactionSql
 
 /** What a caller emits. The envelope's `id`, `occurredAt` and `producer` are added here. */
-export interface DomainEvent {
-  /** `<service>.<aggregate>.<past-tense-verb>` — `identity.session.created`. */
-  readonly topic: string
+export interface DomainEvent<Topic extends string = IdentityTopic> {
+  /**
+   * `<service>.<aggregate>.<past-tense-verb>` — `identity.session.created`.
+   *
+   * **Not `string`.** It was, and that is exactly how this service came to emit
+   * `identity.mfa.changed` at a bus where every consumer classifies `identity.mfa.removed`: the
+   * compiler had no opinion, no test read the emit sites, and the event was written, signed,
+   * delivered and silently discarded for the life of the service. The parameter defaults to
+   * `IdentityTopic` so every call site in this repository is pinned without naming it, while the
+   * type stays general enough to keep this file the same shape as the service template's.
+   * `topics.ts` is where the set is decided and reconciled with the shared registry.
+   */
+  readonly topic: Topic
   /** Ordering is per `(topic, key)` only. Choose the aggregate id, never a timestamp. */
   readonly key: string
   readonly payload: Record<string, unknown>
@@ -79,7 +97,7 @@ export interface EventEnvelope {
   readonly payload: Record<string, unknown>
 }
 
-export type Emit = (event: DomainEvent) => void
+export type Emit<Topic extends string = IdentityTopic> = (event: DomainEvent<Topic>) => void
 
 /**
  * Run a domain change and its events in one transaction.

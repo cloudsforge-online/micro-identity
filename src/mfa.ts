@@ -202,9 +202,10 @@ export async function activateTotp(
     // Any previously active TOTP factor is revoked in the same statement that promotes this one:
     // the partial unique index permits exactly one, and doing it in two statements would fail the
     // second half of a re-enrolment with a constraint violation the user cannot act on.
-    await tx`
+    const superseded = await tx<{ id: string }[]>`
       update mfa_factors set status = 'revoked'
        where user_id = ${input.userId} and kind = 'totp' and status = 'active'
+      returning id
     `
     const updated = await tx<FactorRow[]>`
       update mfa_factors
@@ -212,11 +213,22 @@ export async function activateTotp(
        where id = ${input.factorId}
       returning id, user_id, kind, label, null as secret_enc, status, last_used_at, created_at
     `
-    emitMfaChanged(emit, {
+    // Counted after both statements, inside the transaction, so the number on the event is the
+    // number that is true once it commits. A consumer rendering "you have N factors" from a
+    // count taken before the promotion would be off by one on every enrolment.
+    const active = await tx<{ n: number }[]>`
+      select count(*)::int as n
+        from mfa_factors where user_id = ${input.userId} and status = 'active'
+    `
+    emitMfaAdded(emit, {
       userId: input.userId,
-      change: 'enrolled',
       kind: 'totp',
       factorId: input.factorId,
+      replacedPrevious: superseded.length > 0,
+      remainingActive: active[0]?.n ?? 1,
+      // Not critical. Adding a factor makes an account harder to take over, and 10.3's critical
+      // list is the set of changes that make it easier — a user who has muted everything should
+      // not be interrupted to be told their own enrolment worked.
       critical: false,
       correlationId: input.correlationId,
     })
@@ -263,9 +275,10 @@ export async function generateRecoveryCodes(
   const codes = Array.from({ length: RECOVERY_CODE_COUNT }, recoveryCode)
 
   await withOutbox(sql, 'identity', async (tx, emit) => {
-    await tx`
+    const superseded = await tx<{ id: string }[]>`
       update mfa_factors set status = 'revoked'
        where user_id = ${input.userId} and kind = 'recovery_code' and status = 'active'
+      returning id
     `
     await tx`
       insert into mfa_factors (id, user_id, kind, label, status, activated_at)
@@ -276,14 +289,21 @@ export async function generateRecoveryCodes(
         insert into mfa_recovery_codes (factor_id, code_hash) values (${factorId}, ${hashRecoveryCode(code)})
       `
     }
-    emitMfaChanged(emit, {
+    const active = await tx<{ n: number }[]>`
+      select count(*)::int as n
+        from mfa_factors where user_id = ${input.userId} and status = 'active'
+    `
+    emitMfaAdded(emit, {
       userId: input.userId,
-      change: 'recovery_codes_regenerated',
       kind: 'recovery_code',
       factorId,
+      replacedPrevious: superseded.length > 0,
+      remainingActive: active[0]?.n ?? 1,
       // SD-04 tier 2: the USE of a recovery code emits a critical notification, and so does minting
       // a new set — an attacker who has the password and regenerates the codes has just locked the
-      // real owner out of their own recovery path, and this is the only signal of it.
+      // real owner out of their own recovery path, and this is the only signal of it. This is the
+      // one `identity.mfa.added` that is critical, which is why criticality is a payload field
+      // rather than a property of the topic.
       critical: true,
       correlationId: input.correlationId,
     })
@@ -457,11 +477,19 @@ export async function removeFactor(sql: Db, input: RemoveFactorInput): Promise<F
     await tx`update mfa_factors set status = 'revoked' where id = ${input.factorId}`
     const target = factors.find((f) => f.id === input.factorId)!
 
-    emitMfaChanged(emit, {
+    const remainingActive = classified.kind === 'ordinary' ? classified.remainingActive : 0
+
+    emitMfaRemoved(emit, {
       userId: input.userId,
-      change: lastActive ? 'last_factor_removed' : 'removed',
       kind: target.kind,
       factorId: input.factorId,
+      // The distinction the old `change` field encoded as a separate value, `last_factor_removed`,
+      // put where consumers already look for it: `activity` branches on `wasLast` to say "your
+      // account is no longer protected by a second factor", and `notify` reads it to fill in the
+      // remaining-factor count. Neither could ever see it before, because the producer spelled it
+      // as a variant of a field they did not read.
+      wasLast: lastActive,
+      remainingActive,
       // 10.3: a critical security notification ignores preferences and always sends. Dropping to
       // password-only is exactly the change a user must be told about even if they have muted
       // everything, because the person who did it may not be them.
@@ -472,32 +500,103 @@ export async function removeFactor(sql: Db, input: RemoveFactorInput): Promise<F
     return {
       factorId: input.factorId,
       wasLastActive: lastActive,
-      remainingActive: classified.kind === 'ordinary' ? classified.remainingActive : 0,
+      remainingActive,
     }
   })
 }
 
-function emitMfaChanged(
+/* --------------------------------------------------------------------------- the MFA topics
+ *
+ * There are two, and there used to be one called `identity.mfa.changed`. The rename is not
+ * cosmetic, so the reasoning is recorded here rather than in a commit message.
+ *
+ * `changed` carried a `change` discriminator over four values — enrolled, removed,
+ * last_factor_removed, recovery_codes_regenerated — which is four payload shapes wearing one
+ * topic name. Three things say that is the wrong side of the argument:
+ *
+ *   1. The shared registry gives every topic exactly one `payloadType`. A topic whose payload
+ *      means something different depending on a field inside it cannot honour that, so `changed`
+ *      was unregisterable by construction — and indeed was never registered, which is why every
+ *      one of these events was delivered to a bus where nothing classified it and dropped.
+ *   2. The estate's naming rule is `<service>.<aggregate>.<past-tense-verb>`. "Changed" is a verb
+ *      that excludes nothing; it is the name you choose when the decision has not been taken.
+ *   3. Every consumer had already taken the decision independently. `notify` carries two rules,
+ *      `identity.mfa.removed` and `identity.mfa.added`, each rendering a different sentence.
+ *      `activity` and `analytics` classify `identity.mfa.removed`. The registry names
+ *      `identity.mfa.removed`, payload type `MfaFactorRemoved`. The producer was alone.
+ *
+ * **The ordering argument that justified one topic does not survive contact with the bus.** The
+ * old comment here said a single topic stopped "enrolled then removed" being reordered into
+ * "removed then enrolled". Ordering is per `(topic, key)` and by nothing else, so that is true —
+ * but it only buys anything for a consumer that folds the stream into MFA state, and such a
+ * consumer would already be wrong: delivery is at-least-once, so it would double-count on any
+ * redelivery. The correct fix is the one taken below — make every payload self-describing, so a
+ * consumer never needs the ordering. `wasLast` and `remainingActive` are on the event precisely
+ * so that a removal can be rendered without knowing what came before it.
+ *
+ * Recovery-code regeneration is `identity.mfa.added`, not a third topic. It revokes the standing
+ * recovery-code factor and mints a replacement — structurally identical to re-enrolling TOTP,
+ * which also revokes the previous active factor of its kind. `replacedPrevious` carries the
+ * distinction that actually matters to a reader, and `critical` carries the one that matters to
+ * notify: minting new codes locks the real owner out of their recovery path, so it is news even
+ * though enrolment is not.
+ *
+ * Both are keyed on the user rather than the factor. The registry pins `keyedBy: user_id` for
+ * `identity.mfa.removed`, and the key is the ordering partition, so it is contract rather than
+ * preference: two removals on one account stay in order relative to each other.
+ */
+
+function emitMfaAdded(
   emit: Parameters<Parameters<typeof withOutbox>[2]>[1],
   input: {
     userId: string
-    change: 'enrolled' | 'removed' | 'last_factor_removed' | 'recovery_codes_regenerated'
     kind: MfaKind
     factorId: string
+    /** True when this activation revoked a standing factor of the same kind. */
+    replacedPrevious: boolean
+    remainingActive: number
     critical: boolean
     correlationId: string
   },
 ): void {
   emit({
-    topic: 'identity.mfa.changed',
-    // Keyed on the user, not the factor: ordering is per (topic, key), and "enrolled then removed"
-    // for one account must not be reorderable into "removed then enrolled" by a consumer.
+    topic: 'identity.mfa.added',
     key: input.userId,
     payload: {
       userId: input.userId,
-      change: input.change,
       kind: input.kind,
       factorId: input.factorId,
+      replacedPrevious: input.replacedPrevious,
+      remainingActive: input.remainingActive,
+      critical: input.critical,
+    },
+    actor: `user:${input.userId}`,
+    correlationId: input.correlationId,
+  })
+}
+
+function emitMfaRemoved(
+  emit: Parameters<Parameters<typeof withOutbox>[2]>[1],
+  input: {
+    userId: string
+    kind: MfaKind
+    factorId: string
+    /** The account has no active factor left. `notify` and `activity` both branch on this. */
+    wasLast: boolean
+    remainingActive: number
+    critical: boolean
+    correlationId: string
+  },
+): void {
+  emit({
+    topic: 'identity.mfa.removed',
+    key: input.userId,
+    payload: {
+      userId: input.userId,
+      kind: input.kind,
+      factorId: input.factorId,
+      wasLast: input.wasLast,
+      remainingActive: input.remainingActive,
       critical: input.critical,
     },
     actor: `user:${input.userId}`,
