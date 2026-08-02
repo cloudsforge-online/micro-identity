@@ -32,7 +32,7 @@
 
 import { grantsAllScopes, isScope, type Scope } from '@cloudsforge/contracts-auth'
 import { env } from './env.ts'
-import { SERVICE_TTL_SECONDS, issueServiceToken } from './tokens.ts'
+import { clampServiceTtl, issueServiceToken } from './tokens.ts'
 import type { Db } from './outbox.ts'
 
 /** No configuration grants this service anything. Fail-closed: an unknown service gets no token. */
@@ -70,9 +70,17 @@ export class UnknownScopeError extends Error {
 export interface IssueServiceTokenInput {
   readonly service: string
   readonly scopes: readonly string[]
-  /** The operator who asked. Null only for a bootstrap path, which this build does not have. */
+  /**
+   * The operator who asked, when a human asked. Null when a service minted for itself against a
+   * credential, in which case `issuedByCredential` names the row instead — see serviceCredentials.ts.
+   * Exactly one of the two is set, and between them the issuance ledger can always answer "by whom".
+   */
   readonly issuedBy: string | null
+  /** The `service_credentials` row that minted this, when a machine did. */
+  readonly issuedByCredential?: string | null
   readonly correlationId: string
+  /** Requested lifetime. Clamped to `SERVICE_TTL_SECONDS`; may only shorten. */
+  readonly ttlSeconds?: number | null
 }
 
 export interface IssuedServiceToken {
@@ -121,21 +129,30 @@ export async function issueServiceTokenFor(
   // The jti is minted here and written to the ledger BEFORE the token is signed, so a token that
   // exists always has a row. The other order would produce, on a crash between the two, a live
   // credential with no record of who asked for it — which is the exact property being retired.
+  // Clamped BEFORE the ledger row is written, so `expires_at` in the audit trail is the expiry the
+  // token actually carries. Writing the ceiling here and signing something shorter would make the
+  // one record of an issuance disagree with the credential it records.
+  const ttl = clampServiceTtl(input.ttlSeconds)
+
   const jti = crypto.randomUUID()
-  const expiresAt = new Date(Date.now() + SERVICE_TTL_SECONDS * 1000)
+  const expiresAt = new Date(Date.now() + ttl * 1000)
   await sql`
-    insert into service_token_issues (jti, service, scopes, issued_by, expires_at, correlation_id)
-    values (${jti}, ${input.service}, ${requested}, ${input.issuedBy}, ${expiresAt}, ${input.correlationId})
+    insert into service_token_issues
+      (jti, service, scopes, issued_by, issued_by_credential, expires_at, correlation_id)
+    values (
+      ${jti}, ${input.service}, ${requested}, ${input.issuedBy},
+      ${input.issuedByCredential ?? null}, ${expiresAt}, ${input.correlationId}
+    )
   `
 
-  const token = await issueServiceToken(sql, input.service, requested, jti)
+  const token = await issueServiceToken(sql, input.service, requested, jti, ttl)
   return {
     token,
     jti,
     service: input.service,
     scopes: requested,
     expiresAt: expiresAt.toISOString(),
-    expiresInSeconds: SERVICE_TTL_SECONDS,
+    expiresInSeconds: ttl,
   }
 }
 

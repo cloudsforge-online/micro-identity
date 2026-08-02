@@ -89,6 +89,14 @@ import {
   issueServiceTokenFor,
 } from './serviceTokens.ts'
 import {
+  CREDENTIAL_PREFIX,
+  InvalidCredentialError,
+  createServiceCredential,
+  exchangeServiceCredential,
+  listServiceCredentials,
+  revokeServiceCredential,
+} from './serviceCredentials.ts'
+import {
   NotPendingDeletionError,
   WouldOrphanOrganisationsError,
   cancelDeletion,
@@ -478,6 +486,11 @@ async function handle(
     if (err instanceof UnknownScopeError) {
       return errorReply(400, 'unknown_scope', err.message, ctx.requestId)
     }
+    if (err instanceof InvalidCredentialError) {
+      // 401 and not 403: the caller failed to authenticate at all rather than being refused
+      // something. Unknown and revoked land here identically — see `resolve`.
+      return errorReply(401, 'unauthenticated', err.message, ctx.requestId)
+    }
     if (err instanceof FactorNotFoundError || err instanceof OrganisationNotFoundError) {
       return errorReply(404, 'not_found', err.message, ctx.requestId)
     }
@@ -601,6 +614,26 @@ function requireString(body: Record<string, unknown>, field: string): string {
 function optionalString(body: Record<string, unknown>, field: string): string | undefined {
   const value = body[field]
   return typeof value === 'string' && value.trim() !== '' ? value : undefined
+}
+
+/**
+ * An optional requested token lifetime.
+ *
+ * Validated here so `clampServiceTtl`'s `RangeError` never reaches the error mapper, where it would
+ * have to be caught by type and would then turn any unrelated RangeError in this service into a
+ * 400. The clamp itself still refuses the same values — this is the HTTP-shaped half of one rule,
+ * not a second rule.
+ *
+ * Absent is not the same as invalid: absent means "no preference" and takes the ceiling, whereas a
+ * zero, a fraction or a string is a caller who thinks they are asking for something and is not.
+ */
+function readTtlSeconds(body: Record<string, unknown>): number | null {
+  const value = body['ttlSeconds']
+  if (value === undefined || value === null) return null
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 1) {
+    throw new BadRequestError('ttlSeconds must be a positive integer number of seconds')
+  }
+  return value
 }
 
 /* ------------------------------------------------------------------------ routes */
@@ -1305,6 +1338,137 @@ function buildRoutes(): Route[] {
           expiresIn: issued.expiresInSeconds,
         },
       }
+    }),
+
+    /* ------------------------------------------------------ service credentials (the cliff fix) */
+
+    /**
+     * **Exchange a service credential for a short-lived service token.**
+     *
+     * This is the route whose absence is the ten-minute cliff. Until it existed the only issuer of
+     * a service token was an operator holding the `admin` role, so a service could be GIVEN a token
+     * at deploy time and could never obtain another; ten minutes later every service-to-service
+     * call on the money tier failed. See serviceCredentials.ts for why the answer is a credential
+     * rather than a longer TTL.
+     *
+     * NOT `authenticate()`. The credential is not a JWT and must never be handed to `verifyToken` —
+     * it would be rejected as malformed, and more importantly a route that accepted either a token
+     * or a credential would let a service token mint its own successor, which is an unexpiring
+     * credential assembled out of expiring parts.
+     *
+     * The service minted for comes from the credential row, never the request body. There is
+     * deliberately no `service` field to send.
+     */
+    define('POST', '/service-tokens/exchange', async (ctx, deps) => {
+      const header = headerOf(ctx.req, 'authorization')
+      const presented = header?.startsWith('Bearer ') ? header.slice(7).trim() : null
+      if (!presented) throw new UnauthenticatedError('no service credential presented')
+      // Shape-checked before the database is touched: a caller sending a JWT here has made a
+      // category error, and saying so beats a bare 401 that reads as "wrong secret".
+      if (!presented.startsWith(CREDENTIAL_PREFIX)) {
+        throw new UnauthenticatedError(
+          `a service credential is expected here (it begins '${CREDENTIAL_PREFIX}'), not a token`,
+        )
+      }
+
+      // `readJson` answers `{}` for an empty body, which is the common case: a token provider that
+      // wants its whole allowlist for the default lifetime sends nothing at all.
+      const body = await readJson(ctx.req)
+      const rawScopes = body['scopes']
+      if (rawScopes !== undefined) {
+        if (!Array.isArray(rawScopes) || rawScopes.some((s) => typeof s !== 'string')) {
+          throw new BadRequestError('scopes must be an array of scope strings')
+        }
+      }
+
+      const issued = await exchangeServiceCredential(deps.sql, {
+        secret: presented,
+        scopes: rawScopes as string[] | undefined,
+        ttlSeconds: readTtlSeconds(body),
+        correlationId: ctx.requestId,
+      })
+      deps.metrics.increment('identity_service_tokens_issued_total', { service: issued.service })
+      ctx.log.info('service token issued from a credential', {
+        audit: 'service_token_issued',
+        service: issued.service,
+        scopes: issued.scopes,
+        jti: issued.jti,
+        expiresIn: issued.expiresInSeconds,
+        // The jti and the service, never the credential and never the token. This service has
+        // already had one incident where a live credential reached stdout (passwordReset.ts) and it
+        // is not having a second; `service_token_issues.issued_by_credential` is where the link to
+        // the credential row lives, which is a table rather than a log.
+      })
+      return {
+        status: 201,
+        body: {
+          token: issued.token,
+          jti: issued.jti,
+          service: issued.service,
+          scopes: issued.scopes,
+          expiresAt: issued.expiresAt,
+          expiresIn: issued.expiresInSeconds,
+        },
+      }
+    }),
+
+    /**
+     * Create a credential. Admin-only, and the secret is in the response exactly once.
+     *
+     * An operator does this once per service per estate, rather than once per ten minutes, which is
+     * the whole point.
+     */
+    define('POST', '/service-credentials', async (ctx, deps) => {
+      const claims = await authenticateAdmin(ctx, deps)
+      const body = await readJson(ctx.req)
+      const service = requireString(body, 'service')
+      const label = optionalString(body, 'label') ?? `${service} credential`
+
+      const created = await createServiceCredential(deps.sql, {
+        service,
+        label,
+        createdBy: claims.sub,
+      })
+      ctx.log.info('service credential created', {
+        audit: 'service_credential_created',
+        service: created.service,
+        credentialId: created.id,
+        createdBy: claims.sub,
+      })
+      return {
+        status: 201,
+        body: {
+          id: created.id,
+          service: created.service,
+          label: created.label,
+          // Once. Only the SHA-256 is stored, so there is nothing to read back — the same property
+          // that stops anyone with database access from minting for a service.
+          secret: created.secret,
+        },
+      }
+    }),
+
+    define('GET', '/service-credentials', async (ctx, deps) => {
+      await authenticateAdmin(ctx, deps)
+      return { status: 200, body: { credentials: await listServiceCredentials(deps.sql) } }
+    }),
+
+    /**
+     * Revoke. The containment lever a bearer JWT cannot have: a compromised service is offline
+     * within one token lifetime rather than one deploy cycle.
+     */
+    define('POST', '/service-credentials/:id/revoke', async (ctx, deps) => {
+      const claims = await authenticateAdmin(ctx, deps)
+      const id = ctx.params['id'] ?? ''
+      if (!(await revokeServiceCredential(deps.sql, id))) {
+        throw new NotFoundError('no such service credential')
+      }
+      ctx.log.warn('service credential revoked', {
+        audit: 'service_credential_revoked',
+        credentialId: id,
+        revokedBy: claims.sub,
+      })
+      return { status: 200, body: { id, revoked: true } }
     }),
 
     /* ---------------------------------------------------------------- deletion */

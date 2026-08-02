@@ -69,12 +69,35 @@ export async function issueAccessToken(sql: Db, subject: AccessSubject): Promise
     .sign(key.privateKey)
 }
 
+/**
+ * Clamp a requested service-token lifetime.
+ *
+ * **This can only ever SHORTEN.** `SERVICE_TTL_SECONDS` is the ceiling and nothing a caller sends
+ * can raise it, which is why a caller-supplied lifetime is safe to accept at all: the security
+ * property SD-05 bought — a leaked service token expires fast — is a maximum, and a caller asking
+ * for less is asking for more of that property rather than less. A job that needs thirty seconds
+ * should hold a credential for thirty seconds; that is the same "minted for a job, not for a day"
+ * reasoning that set the ceiling, applied one level down.
+ *
+ * A non-integer, a zero or a negative is a caller error rather than a request for a short token,
+ * and answering it with the ceiling would hand out a LONGER token than the caller believed it
+ * asked for. `null` means "no preference" and takes the ceiling.
+ */
+export function clampServiceTtl(requested: number | null | undefined): number {
+  if (requested === null || requested === undefined) return SERVICE_TTL_SECONDS
+  if (!Number.isInteger(requested) || requested < 1) {
+    throw new RangeError('ttlSeconds must be a positive integer number of seconds')
+  }
+  return Math.min(requested, SERVICE_TTL_SECONDS)
+}
+
 /** Sign a service token. See serviceTokens.ts for who may ask for one and with which scopes. */
 export async function issueServiceToken(
   sql: Db,
   service: string,
   scopes: readonly Scope[],
   jti: string,
+  ttlSeconds: number = SERVICE_TTL_SECONDS,
 ): Promise<string> {
   const key = await getSigningKey(sql)
   return new SignJWT({ typ: 'service', scopes: [...scopes] })
@@ -87,7 +110,7 @@ export async function issueServiceToken(
     .setAudience(AUDIENCE)
     .setJti(jti)
     .setIssuedAt()
-    .setExpirationTime(`${SERVICE_TTL_SECONDS}s`)
+    .setExpirationTime(`${clampServiceTtl(ttlSeconds)}s`)
     .sign(key.privateKey)
 }
 

@@ -66,6 +66,7 @@ const ALL_TABLES = [
   'auth_exchange_codes',
   'login_attempts',
   'service_token_issues',
+  'service_credentials',
   'profiles',
   'users',
   'signing_keys',

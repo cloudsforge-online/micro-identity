@@ -449,6 +449,63 @@ export const MIGRATIONS: readonly Migration[] = [
       create unique index if not exists users_email_lower_uniq on users (lower(email));
     `,
   },
+  {
+    version: 11,
+    name: 'service_credentials',
+    // **The missing half of SD-05, and the fix for the ten-minute cliff.**
+    //
+    // SD-05 gave every service a scoped ten-minute token and retired the two omnipotent shared
+    // secrets. What it never gave them was a way to obtain the SECOND token. `POST /service-tokens`
+    // requires the `admin` role, so the only issuer is a human operator; the estate's answer was to
+    // mint twenty-one tokens at deploy time into environment variables and hand them to containers
+    // that read them once at boot. Ten minutes later every service-to-service call on the money tier
+    // fails, and no per-service suite can see it because each one mints a fresh token as it starts.
+    //
+    // A credential row is what a service holds AT REST so that it can mint for itself, for ever,
+    // without an operator and without a token that outlives its purpose. **This is emphatically not
+    // the return of `PAY_SERVICE_TOKEN`.** That was one bearer string, shared by three containers,
+    // granting read/debit/credit/liquidate over every user's money, with no identity, no scope, no
+    // expiry and no audit trail. A row here has all four: it names exactly one service, it can mint
+    // only within that service's `IDENTITY_SERVICE_TOKEN_GRANTS` allowlist, every token it mints
+    // still dies in ten minutes, and every exchange leaves a `service_token_issues` row pointing
+    // back at it. Holding one authorises nothing at the money tier directly — it buys a scoped,
+    // short-lived token and nothing else.
+    //
+    // **And unlike a JWT it is revocable.** `revoked_at` takes a compromised service offline within
+    // one token lifetime. That is a containment lever the estate does not have today: a leaked
+    // service token cannot be recalled at all, only waited out.
+    //
+    // SHA-256 AND NOT SCRYPT, which is the opposite of `users.password_hash` and deliberately so.
+    // The secret is 32 bytes from `randomBytes` — there is no dictionary to attack and no human
+    // memory to be weak — so the slow salted hash buys nothing, while an unsalted digest is what
+    // makes the row FINDABLE by the secret the caller presents. `refresh_tokens.token_hash` is the
+    // same decision for the same reason, and this follows it rather than inventing a second shape.
+    up: `
+      create table if not exists service_credentials (
+        id           uuid        primary key,
+        service      text        not null,
+        secret_hash  text        not null unique,
+        label        text        not null,
+        created_by   uuid        references users (id) on delete set null,
+        created_at   timestamptz not null default now(),
+        last_used_at timestamptz,
+        revoked_at   timestamptz
+      );
+
+      -- Partial: the lookup that matters is "the live credentials for this service", and a revoked
+      -- row is never a candidate for one.
+      create index if not exists service_credentials_live_idx
+        on service_credentials (service) where revoked_at is null;
+
+      -- Which credential minted this token. Null for the admin path, which keeps issued_by.
+      -- "Which service was granted what, by whom, and when" is the question SD-05 exists to answer,
+      -- and once a machine can mint, "by whom" has a second possible shape that must be recorded or
+      -- the ledger quietly stops being able to answer it.
+      alter table service_token_issues
+        add column if not exists issued_by_credential uuid
+          references service_credentials (id) on delete set null;
+    `,
+  },
 ]
 
 /**
