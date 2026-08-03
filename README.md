@@ -5,6 +5,8 @@ reuse detection, organisations and memberships, the SSO hand-off, account deleti
 keys with a published-then-activated rotation, and the JWKS that every other service in the estate
 fetches before it can verify anything.
 
+Design authority: [`ecosystem/03-repository-responsibilities.md`](https://github.com/cloudsforge-online/micro-docs/blob/main/ecosystem/03-repository-responsibilities.md)
+
 > **It authenticates; it does not authorise a product.** `users.roles` is platform roles only, and
 > the schema says why: "the moment a product permission becomes a platform role, every service has
 > to understand every product's authorisation model" (`src/migrations.ts:116-119`). Product
@@ -393,3 +395,10 @@ transactional rotation, and none of them can be proved against a fake. CI is the
   route sets it.
 * **§3.3g's stated reason is wrong** (the conclusion is not). Recorded above; reported rather than
   edited, because this task's remit is this repository's README.
+
+---
+
+## Provenance
+
+The code in this repository was written by **Claude Opus 5** and **Claude Fable 5**, under
+human direction and review.
