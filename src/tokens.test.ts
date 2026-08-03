@@ -543,6 +543,31 @@ test('an origin that is not on the allowlist is refused at mint, not at redempti
   assert.equal(await createHandoffCode(db, user.id, 'https://evil.example'), null)
 })
 
+test('an EMPTY allowlist mints nothing at all — the shipped default fails closed', { skip }, async () => {
+  // `IDENTITY_HANDOFF_ORIGINS=` is the default `env.ts` applies and the value every deployment has
+  // until somebody sets one, so it is the state this control spends most of its life in — and until
+  // now nothing exercised it, because `testsupport.ts` sets two origins before any test file is
+  // evaluated. Hence the explicit allowlist parameter on `createHandoffCode`.
+  //
+  // The first origin below is one the suite's OWN configuration allows. That is the point: with an
+  // empty list even a legitimate surface is refused, which is what distinguishes "empty means none"
+  // from the mistake it is one character away from — "empty means allow everything".
+  const user = await makeUser()
+  for (const origin of [
+    'https://app.test.cloudsforge.local',
+    'https://play.test.cloudsforge.local',
+    'https://hub.cloudsforge.online',
+    'https://evil.example',
+  ]) {
+    assert.equal(await createHandoffCode(db, user.id, origin, []), null, origin)
+  }
+
+  // And the refusal is a refusal, not a mint whose code merely cannot be redeemed later: a row here
+  // would be a credential sitting in the database for an origin the platform never agreed to.
+  const rows = await sql<{ n: number }[]>`select count(*)::int as n from auth_exchange_codes`
+  assert.equal(rows[0]!.n, 0, 'a refused hand-off must leave no code behind')
+})
+
 test('an expired hand-off code is refused, and expired rows are swept', { skip }, async () => {
   const user = await makeUser()
   const code = await createHandoffCode(db, user.id, 'https://app.test.cloudsforge.local')

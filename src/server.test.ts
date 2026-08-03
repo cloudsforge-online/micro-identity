@@ -881,6 +881,48 @@ test('one address cannot register without bound', { skip }, async () => {
   assert.equal(login.status, 401, 'a different route has its own budget')
 })
 
+test('minting a hand-off code is throttled, and a REFUSAL costs the same as a success', { skip }, async () => {
+  // `/auth/handoff` had no entry in LIMITS at all while `/auth/handoff/redeem` had one, so the mint
+  // half of the pair was uncapped. It matters more than an unthrottled authenticated route usually
+  // does: minting is the estate's only probe of IDENTITY_HANDOFF_ORIGINS, and an uncapped one
+  // enumerates the allowlist by the difference between 201 and 403.
+  const registered = await register()
+  const from = { 'x-forwarded-for': '198.51.100.201' }
+  const statuses: number[] = []
+  let retryAfter = 0
+
+  for (let attempt = 0; attempt < 22; attempt += 1) {
+    // EVERY call here is refused — `https://evil.example` is not on the suite's allowlist — so this
+    // does not merely check that twenty successes are capped. It is the shape `micro-custody` was
+    // found in: two paths threw plain `Error`s where refusals belonged, reached the route as 500s
+    // writing no audit row, and its limiter counts audit rows — so a route that WAS in the throttle
+    // table was an unlimited probe path in practice. Identity's limiter is taken in `handle()`
+    // before `route.handle()` runs, so nothing the handler does or fails to do can decide whether a
+    // request was counted. Twenty-two refusals must still produce a 429.
+    const response = await call('POST', '/auth/handoff', {
+      token: registered.accessToken,
+      body: { redirectOrigin: 'https://evil.example' },
+      headers: from,
+    })
+    statuses.push(response.status)
+    if (response.status === 429) retryAfter = Number(response.headers.get('retry-after'))
+  }
+
+  assert.equal(statuses.filter((s) => s === 403).length, 20, 'twenty refusals, then the ceiling')
+  assert.equal(statuses.filter((s) => s === 429).length, 2)
+  assert.equal(statuses.filter((s) => s === 201).length, 0, 'not one of these may have minted')
+  assert.ok(retryAfter > 0, 'a 429 must say when to come back')
+
+  // The pair carries one number, because a mint and a redemption are two halves of ONE cross-surface
+  // navigation. A caller that has exhausted its mints has not exhausted its redemptions: the code it
+  // already holds must still be spendable, or the throttle would strand a user mid-sign-in.
+  const redeem = await call('POST', '/auth/handoff/redeem', {
+    body: { code: 'a'.repeat(64) },
+    headers: { ...from, origin: 'https://app.test.cloudsforge.local' },
+  })
+  assert.equal(redeem.status, 401, 'the other half of the pair has its own budget')
+})
+
 /* ------------------------------------------------------------------ what must NOT be here */
 
 test('identity serves no product surface', { skip }, async () => {

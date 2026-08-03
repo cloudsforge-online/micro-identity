@@ -27,9 +27,22 @@ const CODE_TTL_MS = 60_000
 
 const hashCode = (code: string): string => createHash('sha256').update(code).digest('hex')
 
-/** Is this origin one the estate is allowed to hand tokens to? */
-export function isAllowedOrigin(origin: string): boolean {
-  return env.handoffOrigins.includes(origin)
+/**
+ * Is this origin one the estate is allowed to hand tokens to?
+ *
+ * The allowlist is a parameter with the configured list as its default, for one reason: **the
+ * EMPTY allowlist is the shipped default and the case most worth proving, and it is the one case
+ * a test cannot otherwise reach.** `env.ts` reads `process.env` once at import, and `testsupport.ts`
+ * has already set two origins by the time any test file is evaluated — so without this parameter
+ * the behaviour of `IDENTITY_HANDOFF_ORIGINS=` is a claim in a comment rather than something the
+ * suite runs. A security control whose most important state is the one nobody has exercised is a
+ * control nobody has tested. See `an EMPTY allowlist mints nothing at all` in `tokens.test.ts`.
+ */
+export function isAllowedOrigin(
+  origin: string,
+  allowlist: readonly string[] = env.handoffOrigins,
+): boolean {
+  return allowlist.includes(origin)
 }
 
 /**
@@ -38,13 +51,21 @@ export function isAllowedOrigin(origin: string): boolean {
  * Refuses an origin that is not on the allowlist rather than minting a code that cannot be
  * redeemed, so a misconfiguration is a 400 at the moment it is made instead of a sign-in loop that
  * looks like a client bug.
+ *
+ * **An empty allowlist refuses every origin, and that is the intended production default.** The
+ * membership test below is the only open-redirect guard in the estate's SSO — `hub-web` states
+ * outright that it holds no second list, because a second list is a list that drifts
+ * (`hub-web/src/lib/identity.ts:255-263`). "Empty means allow everything" is how an allowlist
+ * becomes a redirector, so an unset variable must cost cross-surface sign-in rather than cost the
+ * guard. What must NOT be empty is the deployment's value: see `.env.example`.
  */
 export async function createHandoffCode(
   sql: Db,
   userId: string,
   redirectOrigin: string,
+  allowlist: readonly string[] = env.handoffOrigins,
 ): Promise<string | null> {
-  if (!isAllowedOrigin(redirectOrigin)) return null
+  if (!isAllowedOrigin(redirectOrigin, allowlist)) return null
 
   // Opportunistic sweep. This table is otherwise append-only, and an expired row is worth nothing
   // to anyone — least of all to whoever ends up with a copy of the database.

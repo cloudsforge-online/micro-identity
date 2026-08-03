@@ -46,6 +46,32 @@ const PLACEHOLDERS = new Set([
   'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
 ])
 
+/**
+ * Placeholder STEMS, refused wherever they BEGIN a value rather than only when they are the whole
+ * of it.
+ *
+ * ── Why the exact-match set above was not enough ───────────────────────────────────────────────
+ *
+ * This repository's own `.env.example` shipped
+ * `IDENTITY_KEY_SECRET=CHANGE_ME_at_least_32_characters_long`, and that value **booted**: it is 37
+ * characters, so it cleared the length floor, and it is not any of the eight strings above, so it
+ * cleared the placeholder check. A deployer who copies the example and edits everything except the
+ * one line whose whole purpose is to be edited gets a running service whose forging key is a
+ * literal in a public-shaped file — and `IDENTITY_KEY_SECRET` is, in `.env.example`'s own words,
+ * "the estate's universal forging credential": whoever holds it can mint a token for any user and
+ * any service, and every service in the estate accepts it.
+ *
+ * The refusal it slipped past IS the control. Matching the stem rather than the string is what
+ * makes "CHANGE_ME" mean the same thing to this function as it does to the person reading the file,
+ * however they padded it out to clear the length check.
+ *
+ * Compared against the value with separators and case removed, so `CHANGE_ME_…`, `change-me-…` and
+ * `changeMe…` are one rule rather than three that can be added to one at a time.
+ */
+const PLACEHOLDER_STEMS = ['changeme', 'replaceme', 'replacewith', 'yoursecret', 'examplesecret']
+
+const withoutSeparators = (value: string): string => value.toLowerCase().replace(/[^a-z0-9]/g, '')
+
 type Source = Readonly<Record<string, string | undefined>>
 
 function required(source: Source, name: string): string {
@@ -56,7 +82,9 @@ function required(source: Source, name: string): string {
 
 function requiredSecret(source: Source, name: string, minLength = 24): string {
   const value = required(source, name)
-  if (PLACEHOLDERS.has(value.toLowerCase())) {
+  const stripped = withoutSeparators(value)
+  if (PLACEHOLDERS.has(value.toLowerCase()) || PLACEHOLDER_STEMS.some((s) => stripped.startsWith(s))) {
+    // Names the variable, never the value. The message is read out of a deployment log.
     throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
   }
   // Length is a proxy for entropy and the only one available here. It is set above the point at

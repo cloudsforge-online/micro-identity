@@ -398,7 +398,18 @@ export function createServer(deps: ServerDeps): Server {
   })
 }
 
-/** Per-route, per-window ceilings. Well under whatever the gateway allows. */
+/**
+ * Per-route, per-window ceilings. Well under whatever the gateway allows.
+ *
+ * **Taken at dispatch, before the handler runs**, which is what makes an entry here a real ceiling
+ * rather than a ceiling on success. `micro-custody` was found with two paths that threw plain
+ * `Error`s where refusals belonged: they reached the route as 500s writing no audit row, and its
+ * limiter counts audit rows, so a listed route was an unlimited probe path in practice. Nothing of
+ * that shape can happen here — `handle()` calls `limiter.take()` before `route.handle()`, so a 403,
+ * a 401 and a 500 each cost a caller exactly what a 201 does. `minting a hand-off code is
+ * throttled, and a REFUSAL costs the same as a success` in `server.test.ts` drives twenty-two
+ * consecutive refusals and asserts the 429, so the property is exercised rather than asserted.
+ */
 const LIMITS: Readonly<Record<string, number>> = {
   '/auth/register': 5,
   '/auth/login': 10,
@@ -407,6 +418,17 @@ const LIMITS: Readonly<Record<string, number>> = {
   '/auth/password': 10,
   '/auth/password/forgot': 5,
   '/auth/password/reset': 10,
+  // Mint and redeem are the two halves of ONE cross-surface navigation, exactly 1:1 — every code
+  // this route issues is a code `/auth/handoff/redeem` spends — so the pair carries one number.
+  // Below 20 would cap the journey at less than its own second half; above 20 would let a stolen
+  // access token farm codes faster than they can be spent. 20 is also what the other authenticated,
+  // code-issuing routes carry (`/auth/mfa`, `/mfa/totp/:id/activate`) rather than the 10 the
+  // credential-guessing routes get: this one already demands a valid user token to reach.
+  //
+  // It had NO entry at all, which mattered more than an unthrottled authenticated route usually
+  // does: minting is the estate's only origin-allowlist probe, and an unlimited one enumerates the
+  // allowlist by the difference between 201 and 403.
+  '/auth/handoff': 20,
   '/auth/handoff/redeem': 20,
   '/mfa/totp': 10,
   '/mfa/totp/:id/activate': 20,
@@ -1076,8 +1098,17 @@ function buildRoutes(): Route[] {
     define('POST', '/auth/handoff', async (ctx, deps) => {
       const claims = await authenticateUser(ctx, deps)
       const body = await readJson(ctx.req)
-      const code = await createHandoffCode(deps.sql, claims.sub, requireString(body, 'redirectOrigin'))
-      if (!code) throw new ForbiddenError('that origin is not on the hand-off allowlist')
+      const redirectOrigin = requireString(body, 'redirectOrigin')
+      const code = await createHandoffCode(deps.sql, claims.sub, redirectOrigin)
+      if (!code) {
+        // Logged for the same reason the redemption refusal below is: this is the estate's only
+        // origin-allowlist probe, and a refusal that leaves no trace is one nobody can tell from a
+        // deployment that simply forgot to set IDENTITY_HANDOFF_ORIGINS. The origin is the request's
+        // own attacker-controlled input, not a secret, so naming it costs nothing and is the single
+        // fact whoever reads this line needs.
+        ctx.log.warn('hand-off origin refused', { audit: 'handoff_refused', userId: claims.sub, redirectOrigin })
+        throw new ForbiddenError('that origin is not on the hand-off allowlist')
+      }
       return { status: 201, body: { code, expiresInSeconds: 60 } }
     }),
 
