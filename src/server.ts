@@ -28,6 +28,7 @@ import {
   type ServerResponse,
 } from 'node:http'
 import {
+  hasScope,
   isServiceClaims,
   isUserClaims,
   normaliseEmail,
@@ -37,6 +38,7 @@ import {
   type Claims,
   type OrganisationRole,
   type Role,
+  type ServiceClaims,
   type UserClaims,
 } from '@cloudsforge/contracts-auth'
 import type { Lifecycle } from '@cloudsforge/lifecycle'
@@ -102,6 +104,12 @@ import {
   cancelDeletion,
   requestDeletion,
 } from './deletion.ts'
+import {
+  UnknownPlatformRoleError,
+  UserNotFoundError,
+  listGrantsFor,
+  setPlatformRoles,
+} from './platformRoles.ts'
 import {
   listSessions,
   revokeAllSessions,
@@ -513,8 +521,15 @@ async function handle(
       // something. Unknown and revoked land here identically — see `resolve`.
       return errorReply(401, 'unauthenticated', err.message, ctx.requestId)
     }
-    if (err instanceof FactorNotFoundError || err instanceof OrganisationNotFoundError) {
+    if (
+      err instanceof FactorNotFoundError ||
+      err instanceof OrganisationNotFoundError ||
+      err instanceof UserNotFoundError
+    ) {
       return errorReply(404, 'not_found', err.message, ctx.requestId)
+    }
+    if (err instanceof UnknownPlatformRoleError) {
+      return errorReply(400, 'unknown_role', err.message, ctx.requestId)
     }
     if (err instanceof NotPendingDeletionError) {
       return errorReply(409, 'conflict', err.message, ctx.requestId)
@@ -580,6 +595,37 @@ async function authenticateUser(ctx: RequestContext, deps: ServerDeps): Promise<
 async function authenticateAdmin(ctx: RequestContext, deps: ServerDeps): Promise<UserClaims> {
   const claims = await authenticateUser(ctx, deps)
   if (!claims.roles.includes('admin')) throw new ForbiddenError('this route requires the admin role')
+  return claims
+}
+
+/**
+ * A SERVICE token carrying a named scope, and never a user token however privileged.
+ *
+ * The asymmetry with `authenticateAdmin` is the design rather than an oversight. The one route this
+ * guards changes platform roles, and an operator who could reach it with their own token would be a
+ * single pair of eyes on a promotion — which is exactly what admin-api's approval queue exists to
+ * prevent. The lane is a service token so that the only caller is that queue's executor, carrying
+ * an approval id that two operators signed for.
+ *
+ * `typ` is checked before the scope. A user token has no `scopes` claim at all, so `hasScope`
+ * already answers false for one — but a route whose refusal depends on a field being ABSENT reads
+ * as an accident, and the day someone adds `scopes` to `UserClaims` it would silently become one.
+ *
+ * The scope is spelled out here rather than passed in, and that is deliberate on two counts:
+ * `grep -rn 'identity:admin'` across the estate is how the holder of a capability is found, and the
+ * estate's scope audit derives what a repository demands from literals at gate sites — a demand it
+ * cannot resolve fails the build rather than being guessed at, so the shape it reads most plainly
+ * is the shape worth writing.
+ */
+async function authenticateIdentityAdmin(
+  ctx: RequestContext,
+  deps: ServerDeps,
+): Promise<ServiceClaims> {
+  const claims = await authenticate(ctx, deps)
+  if (!isServiceClaims(claims)) throw new ForbiddenError('this route requires a service token')
+  if (!hasScope(claims, 'identity:admin')) {
+    throw new ForbiddenError('this route requires the identity:admin scope')
+  }
   return claims
 }
 
@@ -1500,6 +1546,108 @@ function buildRoutes(): Route[] {
         revokedBy: claims.sub,
       })
       return { status: 200, body: { id, revoked: true } }
+    }),
+
+    /* ---------------------------------------------------------------- platform roles */
+
+    /**
+     * **Change a user's platform roles. The route the estate had no way to reach.**
+     *
+     * Until this existed there was exactly one way an account became an administrator: a human
+     * running `update users set roles = array['admin']` against this database, written into
+     * `deploy/scripts/estate-bootstrap.sh` as a step. `admin-api` answers 501 to
+     * `identity.role.grant` and says why (`admin-api/src/actions.ts`): it will not write to
+     * identity's database to work around the missing route, because one database per service is a
+     * rule this estate checks in CI.
+     *
+     * The bootstrap stays where it is — see `platformRoles.ts` for why a service that can mint its
+     * own first administrator is a service whose compromise grants the estate. What this route adds
+     * is every administrator AFTER the first, each carrying an `approvalId`: two operators'
+     * signatures out of admin-api's four-eyes queue.
+     *
+     * Three things about the guard, all load-bearing:
+     *
+     *   - A SERVICE token holding `identity:admin`. `authenticateAdmin` would refuse a service
+     *     token outright and make the route unreachable from admin-api for the same reason the
+     *     bootstrap is unreachable now — and, more importantly, an operator who could call this
+     *     with their own token would be one pair of eyes on a promotion.
+     *   - `approvalId` is REQUIRED, not optional. An optional one would make the unapproved
+     *     promotion the easy call and the approved one the careful call.
+     *   - The write is a `platform_role_grants` row plus the `users.roles` update in ONE
+     *     transaction, and migration 12's deferred constraint trigger refuses the update otherwise.
+     *     A future edit that forgets the audit row fails at the database, not at review.
+     *
+     * PUT and not PATCH: the body carries the complete resulting set, because a partial update
+     * cannot express a revocation and "remove admin" is the operation that must never be the
+     * awkward one.
+     */
+    define('PUT', '/internal/users/:id/roles', async (ctx, deps) => {
+      const claims = await authenticateIdentityAdmin(ctx, deps)
+      const userId = ctx.params['id'] ?? ''
+      if (!isUuid(userId)) throw new BadRequestError('the user id must be a uuid')
+
+      const body = await readJson(ctx.req)
+      const roles = body['roles']
+      if (!Array.isArray(roles) || roles.some((role) => typeof role !== 'string')) {
+        throw new BadRequestError('roles must be an array of role strings')
+      }
+      const actor = requireString(body, 'actor')
+      const reason = requireString(body, 'reason')
+      const approvalId = requireString(body, 'approvalId')
+      if (!isUuid(approvalId)) throw new BadRequestError('approvalId must be a uuid')
+
+      const change = await setPlatformRoles(deps.sql, {
+        userId,
+        roles: roles as string[],
+        actor,
+        reason,
+        approvalId,
+        correlationId: ctx.requestId,
+      })
+
+      // `warn`, like a signing-key rotation and unlike a sign-in: this is the shape of line an
+      // operator should find when they grep an incident window, and it is not routine traffic.
+      ctx.log.warn('platform roles changed', {
+        audit: 'platform_roles_changed',
+        userId,
+        roles: change.roles,
+        granted: change.granted,
+        revoked: change.revoked,
+        approvalId,
+        actor,
+        // The calling service, so the log answers "which credential did this" as well as "which
+        // operator asked". They are different questions and an incident asks both.
+        caller: claims.sub,
+      })
+      return { status: 200, body: change }
+    }),
+
+    /**
+     * The grant trail for one user — who promoted them, when, on whose approval, and why.
+     *
+     * Same lane as the write. A promotion history names the operators who signed for it, so it is
+     * not something an ordinary token should be able to enumerate.
+     */
+    define('GET', '/internal/users/:id/role-grants', async (ctx, deps) => {
+      await authenticateIdentityAdmin(ctx, deps)
+      const userId = ctx.params['id'] ?? ''
+      if (!isUuid(userId)) throw new BadRequestError('the user id must be a uuid')
+      const grants = await listGrantsFor(deps.sql, userId)
+      return {
+        status: 200,
+        body: {
+          grants: grants.map((grant) => ({
+            id: grant.id,
+            userId: grant.user_id,
+            role: grant.role,
+            source: grant.source,
+            approvalId: grant.approval_id,
+            actor: grant.actor,
+            reason: grant.reason,
+            grantedAt: grant.granted_at.toISOString(),
+          })),
+        },
+      }
     }),
 
     /* ---------------------------------------------------------------- deletion */

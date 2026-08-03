@@ -18,6 +18,7 @@
  */
 
 import postgres from 'postgres'
+import { randomUUID } from 'node:crypto'
 import { migrate, type Sql as DbSql } from '@cloudsforge/db'
 import { MIGRATIONS } from './migrations.ts'
 
@@ -49,6 +50,11 @@ process.env['OUTBOX_SIGNING_SECRET'] ??= 'test-outbox-signing-secret-0123456789'
 process.env['IDENTITY_SERVICE_TOKEN_GRANTS'] ??= JSON.stringify({
   settlement: ['custody:sign:deposit', 'ledger:post', 'ledger:read'],
   market: ['ledger:reserve', 'ledger:read'],
+  // The only holder of `identity:admin`, and the reason the entry is here rather than in a test's
+  // fixture: `parseServiceGrants` refuses an unknown scope at import, so a suite that can mint this
+  // token is a suite that has proved the scope is in the contracts registry. A fake principal would
+  // have proved nothing — that is the exact shape of blindness the estate's scope audit exists for.
+  'admin-api': ['identity:admin'],
 })
 process.env['LOG_LEVEL'] ??= 'error'
 
@@ -67,6 +73,7 @@ const ALL_TABLES = [
   'login_attempts',
   'service_token_issues',
   'service_credentials',
+  'platform_role_grants',
   'profiles',
   'users',
   'signing_keys',
@@ -105,6 +112,35 @@ export async function resetIdentity(sql: postgres.Sql): Promise<void> {
   await sql.unsafe(`truncate ${ALL_TABLES} restart identity cascade`)
   const { forgetSigningKeys } = await import('./keys.ts')
   forgetSigningKeys()
+}
+
+/**
+ * Promote a user to `admin` the way the estate now has to: the grant row and the role in ONE
+ * transaction.
+ *
+ * Before migration 12 every suite that needed an operator wrote `update users set roles =
+ * '{player,admin}'` and that is now refused at COMMIT, which is the guard working rather than a
+ * test-harness inconvenience. It is here rather than copied into three files so that if the shape
+ * of a legitimate promotion ever changes, exactly one place says what it is.
+ *
+ * `source` defaults to `'approval'` because that is what every administrator after the first is:
+ * the `'bootstrap'` grant is one per database for ever, and a helper that spent it by default
+ * would make the second call in any test fail for a reason that has nothing to do with the test.
+ */
+export async function grantAdmin(
+  sql: postgres.Sql,
+  userId: string,
+  source: 'bootstrap' | 'approval' = 'approval',
+): Promise<string | null> {
+  const approvalId = source === 'approval' ? randomUUID() : null
+  await sql.begin(async (tx) => {
+    await tx`
+      insert into platform_role_grants (user_id, role, source, approval_id, actor, reason)
+      values (${userId}, 'admin', ${source}, ${approvalId}, 'test-suite', 'promoted by the suite')
+    `
+    await tx`update users set roles = '{player,admin}' where id = ${userId}`
+  })
+  return approvalId
 }
 
 let counter = 0

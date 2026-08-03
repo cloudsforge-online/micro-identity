@@ -12,9 +12,11 @@ fetches before it can verify anything.
 > platform role — SD-03, restated at `src/server.ts:544`.
 
 > **It cannot mint its own first admin, and that is deliberate.** See
-> [The estate cannot bootstrap itself](#the-estate-cannot-bootstrap-itself) — a service that could
-> grant itself the role that mints every other service's credential would be a service whose
-> compromise grants the estate.
+> [The first administrator](#the-first-administrator) — a service that could grant itself the role
+> that mints every other service's credential would be a service whose compromise grants the estate.
+> What it *can* now do is refuse a second one: the schema permits exactly one **unapproved**
+> administrator per database, for ever, and every administrator after the first carries an approval
+> id out of `micro-admin-api`'s four-eyes queue.
 
 > **It never sees a full IP address.** `truncateIp` reduces it to a /24 or a /48 before it reaches a
 > column, a log line or a response. The prefix carries the whole of the risk signal — "a sign-in
@@ -100,6 +102,8 @@ is a conditional `UPDATE … RETURNING`, hand-off redemption is single-use by ro
 | `GET` | `/organisations/:id/memberships` | user | members of one organisation (`src/server.ts:1219`) |
 | `POST` | `/organisations/:id/memberships` | user | invite, change or remove a member. Refuses anything that would leave the organisation with no accepted owner (`src/server.ts:1229`) |
 | `POST` | `/service-tokens` | **admin** | mints a service token. **The token is returned once and never stored**, so there is nothing to read back (`src/server.ts:1265`, note at `:1288`) |
+| `PUT` | `/internal/users/:id/roles` | **service token holding `identity:admin`** | sets a user's platform roles, writing a `platform_role_grants` row with `source = 'approval'` and the caller's `approvalId` in the same transaction. Refuses an operator's own token: a human who could promote directly would be one pair of eyes. See [The first administrator](#the-first-administrator) |
+| `GET` | `/internal/users/:id/role-grants` | **service token holding `identity:admin`** | the promotion trail for one user — who, when, on whose approval, and why |
 | `DELETE` | `/users/me` | user | requests deletion; the account moves to `pending_deletion`, which is a state you may still authenticate from (`src/server.ts:1304`, reasoning at `:1336`) |
 | `POST` | `/users/me/deletion/cancel` | user | cancels it inside the grace window (`src/server.ts:1339`) |
 | `GET` | `/admin/signing-keys` | **admin** | the key list with statuses (`src/server.ts:1349`) |
@@ -124,36 +128,75 @@ a forged token to fix (`src/server.ts:518-521`).
 
 ---
 
-## The estate cannot bootstrap itself
+## The first administrator
 
-**A fresh deployment cannot issue its first service token, so no service can authenticate to
-another.** Recorded at `docs/ecosystem/18-build-status.md` §3.3g, and re-verified against this
-source:
+**A fresh deployment has no operator, and nothing in this service can create one.** That has not
+changed and must not: `POST /service-tokens` requires the `admin` role (via `authenticateAdmin`), no
+route grants a role to a user who has none, and the column defaults to none
+(`roles text[] not null default '{}'`, `src/migrations.ts:119`). A service that could promote its own
+first operator is a service whose compromise grants the estate, and `micro-admin-api`'s approval
+queue cannot authorise the first grant either, because approving one needs an operator who already
+holds the role. So the first grant is a runbook step, run by a human against this database.
 
-* `POST /service-tokens` requires the `admin` role (`src/server.ts:1266`, via `authenticateAdmin` at
-  `:545`).
-* **No route in this service grants a role.** All twenty-one `POST`, four `DELETE` and zero
-  `PUT`/`PATCH` routes were enumerated above; none writes `users.roles`. The only statement in the
-  repository that writes that column is `registerUser` (`src/users.ts:104-105`).
-* The column defaults to none — `roles text[] not null default '{}'` (`src/migrations.ts:119`).
+**What changed is the shape of that step, not its place.** Until migration 12 it was one statement —
 
-The only way through is `update users set roles = array['admin']` against the database by hand,
-which is what `deploy/scripts/slice-verify.sh` does **and asserts**, so that the day identity grows a
-bootstrap the check fails and is deleted.
+```sql
+update users set roles = array['admin'] where email = '<the operator>';
+```
 
-`micro-admin-api` owns the authorisation half and deliberately did not solve this one: its
-`POST /v1/approvals` returns **501**, naming the route identity would need
-(`PUT /internal/users/:id/roles` behind a service token holding `identity:admin` — *not*
-`authenticateAdmin`, which refuses service tokens at `src/server.ts:540`). A queue that accepts work
-it cannot do leaves a row at `approved` for ever, which reads as two operators having authorised
-something that never happened.
+— and it was *repeatable* (nothing made the second run differ from the first, so it was not a
+bootstrap but a permanent superuser lever), *unaudited* (the most consequential write in the estate
+was the only one with no actor, reason or time), and *unproven* (nothing went red if this service or
+`micro-admin-api` grew a route that did the same thing).
+
+Migration 12 puts three controls in the schema, where a bug, a migration or an operator holding a
+psql connection cannot route around them — the threat model for a privilege escalation here has to
+include a database connection, because the bootstrap is itself a database step:
+
+| control | what it refuses |
+| --- | --- |
+| `platform_role_grants_one_bootstrap`, a **partial unique index** on `source = 'bootstrap'` | a second bootstrap grant, ever, in any transaction, from any client including psql — SQLSTATE 23505. It caps **unapproved** administrators at one rather than administrators at one, because four-eyes approval needs two operators |
+| `users_roles_need_a_grant`, a **deferred constraint trigger** on `users` | a row that *gains* a privileged role without a `platform_role_grants` row for that user and role written **in the same transaction** — 23514, raised at `COMMIT`, so no ordering inside the transaction escapes it. Same-transaction and not merely "a grant exists": otherwise a demoted administrator is re-promotable for ever on the row that authorised the first promotion |
+| `platform_role_grants_immutable`, a **before update or delete trigger** | any `UPDATE` or `DELETE` on a grant row. Without it the one-shot index is re-armable by `delete from platform_role_grants where source = 'bootstrap'` |
+
+Losing a role never needs a grant. A control that could block a revocation would be a liability
+during an incident rather than a safeguard.
+
+The bootstrap step, in its correct shape — **one transaction**, so that a re-run fails at the index
+before the update is attempted and rolls back:
+
+```sql
+begin;
+insert into platform_role_grants (user_id, role, source, actor, reason)
+select id, 'admin', 'bootstrap', 'estate-bootstrap.sh',
+       'first operator of this environment; no approval queue can exist before one'
+  from users where email = lower(btrim('<the operator>'));
+update users set roles = array['player','admin']
+ where email = lower(btrim('<the operator>'));
+commit;
+```
+
+`deploy/scripts/estate-bootstrap.sh:102` still runs the bare `UPDATE`, which migration 12 now
+refuses; `micro-deploy` owns that script and has been told what it must become, including that the
+procedure should assert its own re-run fails.
+
+**Every administrator after the first** comes through `PUT /internal/users/:id/roles`, the route
+`micro-admin-api` specified and answers **501** without. It is gated on a **service** token holding
+`identity:admin` — not `authenticateAdmin`, which refuses a service token outright and would make
+the route unreachable from the queue, and not an operator's own token, because a human who could
+promote directly would be a single pair of eyes on the estate's most consequential write. The
+handler writes the grant row and the `users.roles` update in one transaction; it does not have to be
+trusted to, because the deferred trigger refuses the update otherwise.
+
+The honest limit: the database owner can `alter table … disable trigger` or drop an index, and
+nothing in a schema survives its own superuser. What this buys is that each of those is a
+deliberate, loud, separate act that leaves DDL behind, rather than an `UPDATE` that looks like every
+other `UPDATE`.
 
 > **A correction to §3.3g, found while writing this.** That section says `users.roles` defaults to
 > `'{}'` and therefore "every user is created with none". The default is right; the conclusion is
 > not. `registerUser` inserts `roles = ['player']` explicitly (`src/users.ts:105`), so a freshly
-> registered user has one role — just never `admin`. The bootstrap gap is unchanged and the manual
-> `UPDATE` is still required; only the stated reason was wrong. **Reported, not edited** — this
-> repository's README is the only file this work touches.
+> registered user has one role — just never `admin`.
 
 ---
 
@@ -188,7 +231,7 @@ A dead-lettered recurring job is deliberately **not** re-armed (`src/jobs.ts:65-
 
 ## The database
 
-Migrations 1–10 in `src/migrations.ts`, run only by `src/migrator.ts`. `index.ts` asserts the version
+Migrations 1–12 in `src/migrations.ts`, run only by `src/migrator.ts`. `index.ts` asserts the version
 and refuses to serve below it. `BASELINE_VERSION = 0`: identity is built fresh rather than migrated
 in place, because Nimbus's database keeps serving Nimbus until the cutover.
 
@@ -200,6 +243,9 @@ in place, because Nimbus's database keeps serving Nimbus until the cutover.
 | `mfa_factors_one_active_per_kind`, a **partial** unique index `where status = 'active' and kind in ('totp','recovery_code')` | a second active TOTP factor or recovery-code set | regenerating codes revokes the old set in the same statement that writes the new one; **the index is what makes that atomic rather than merely intended**. Partial because revoked factors are kept as history and a full unique index would refuse the regeneration it is meant to protect (`src/migrations.ts:292`, reasoning at `:289-291`) |
 | `mfa_factors_kind_chk` — `totp`, `webauthn`, `recovery_code`, and **not `sms`** | SMS as a second factor | not an oversight. SIM-swap is the dominant attack against crypto accounts, which makes SMS **weaker than the password it is meant to strengthen**. `contracts-auth`'s `MfaKind` omits it for the same reason, and a kind outside the union is a kind no service can accidentally accept (`src/migrations.ts:283`, reasoning at `:261-265`) |
 | `signing_keys_publication_idx`, a partial index `where status <> 'retired'` on `(created_at, kid)` | nondeterministic JWKS ordering | it is not only an access path, it is the order the document is published in. Nondeterministic ordering was a real split-brain defect (SD-14): two replicas bootstrapping an empty database each minted a key, and an unordered select meant a consumer cached one and rejected every token minted by the other (`src/migrations.ts:179`, reasoning at `:175-178`) |
+| `platform_role_grants_one_bootstrap`, a **partial** unique index `where source = 'bootstrap'` (migration **12**) | a second bootstrap grant, ever, from any client including psql | **the estate gets exactly one administrator that answers to nothing.** Partial and not a plain unique on `source`, because capping *approved* grants at one would make a second administrator impossible and four-eyes approval needs two operators (`src/migrations.ts`, migration 12) |
+| `users_roles_need_a_grant`, a **deferred constraint trigger** on `users` (migration **12**) | a row that gains a privileged role with no grant row written in the same transaction | a CHECK cannot reference another table and cannot see the old row. Deferred so the grant and the promotion may be written in either order, which also means a bare `update users set roles = array['admin']` from psql fails at `COMMIT` rather than being caught by a handler the attacker is already past |
+| `platform_role_grants_immutable`, a before-`UPDATE`-or-`DELETE` trigger (migration **12**) | any edit or deletion of a grant row | without it the one-shot index above is re-armable by one `DELETE`, and a promotion is un-recordable after the fact |
 | `signing_keys.private_jwk_enc` **not null** | a plaintext private key | unlike Nimbus, this schema has never had a plaintext column to fall back to (`src/migrations.ts:163-164`) |
 | `devices_user_fingerprint_uniq` | a duplicate device row per user | the stored value is a hash, never the raw fingerprint: the raw value is a tracking identifier with no use the hash does not serve (`src/migrations.ts:208`, `:200-201`) |
 | `memberships` PK `(organisation_id, user_id)` + `memberships_role_chk` | a duplicate or unnamed role | — |
@@ -322,8 +368,11 @@ transactional rotation, and none of them can be proved against a fake. CI is the
 
 ## Known gaps
 
-* **The bootstrap.** See above. `POST /service-tokens` needs `admin`, nothing grants `admin`, so a
-  fresh deployment needs a manual `UPDATE`. Tracked at `docs/ecosystem/18-build-status.md` §3.3g.
+* **The bootstrap is still a manual step, and stays one.** A fresh deployment needs one transaction
+  run against this database by a human — see [The first administrator](#the-first-administrator).
+  What is no longer a gap is that it was repeatable, unaudited and unproven; migration 12 makes it
+  one-shot, trailed and tested. `micro-deploy` still runs the old bare `UPDATE`, which now fails.
+  Tracked at `docs/ecosystem/18-build-status.md` §3.3g.
 * **WebAuthn is two 501s.** The schema and the routes exist; the implementation does not
   (`src/server.ts:1196`, `:1204`). 501 rather than 404 deliberately — a 404 says "no such thing
   here" and a client cannot tell it from a typo (`src/server.ts:1188-1193`).

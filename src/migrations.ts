@@ -506,6 +506,207 @@ export const MIGRATIONS: readonly Migration[] = [
           references service_credentials (id) on delete set null;
     `,
   },
+  {
+    version: 12,
+    name: 'platform_role_grants',
+    // **THE FIRST ADMINISTRATOR, AND EVERY ONE AFTER.**
+    //
+    // A fresh environment has no operator, and the estate's only way to make one is
+    // `deploy/scripts/estate-bootstrap.sh` running, by hand, against this database:
+    //
+    //     update users set roles = array['admin'] where email = '<the operator>';
+    //
+    // WHERE that runs is right and stays right. `admin-api/src/actions.ts` argues it at length: a
+    // service that can mint its own first administrator is a service whose compromise grants the
+    // estate, and admin-api's own four-eyes queue cannot authorise the first grant because
+    // approving one needs an operator who already holds the role. So admin-api answers 501 to
+    // `identity.role.grant` rather than growing an unauthenticated route that mints an operator,
+    // and `admin-api/src/bootstrap.test.ts` pins that it cannot silently become one.
+    //
+    // WHAT that statement IS was wrong, in three ways that have nothing to do with where it runs:
+    //
+    //   - **Repeatable.** Nothing made the second run differ from the first, so it was not a
+    //     bootstrap but a permanent superuser lever available for ever to anyone who reaches the
+    //     database. "We only run it once" is a convention, not a control.
+    //   - **Unaudited.** Migration 3 gives `users.roles` a default and nothing else, so the most
+    //     consequential write in the estate was the only one with no trail: no actor, no reason,
+    //     no time, no authorising decision.
+    //   - **Unproven.** Nothing went red if identity, or admin-api, grew a route that did the same.
+    //
+    // ## Why this is in the schema and not in a handler
+    //
+    // The threat model explicitly includes someone holding a psql connection — that is the whole
+    // reason the bootstrap is a database step in the first place. A privilege-escalation guard that
+    // lives in a request handler is worth very little against that, because the handler is the
+    // layer the attacker is assumed to be past. `micro-worlds` landed its comparable control as a
+    // BEFORE UPDATE trigger because a CHECK cannot see the old row; admin-api's treasury caps use a
+    // constraint trigger because a CHECK cannot reference another table. Both apply here, so both
+    // shapes are used.
+    //
+    // ## The three controls, and exactly what each refuses
+    //
+    //   1. `platform_role_grants_one_bootstrap` — a partial unique index on `source = 'bootstrap'`.
+    //      **One bootstrap grant per database, for ever.** The second insert raises 23505, in any
+    //      transaction, from any client, including a psql prompt. Capping ADMINISTRATORS at one
+    //      would be wrong: four-eyes approval needs two operators, and an estate that can only ever
+    //      have one has no second pair of eyes. Capping UNAPPROVED administrators at one is the
+    //      invariant that was actually wanted, and it is what this index expresses.
+    //
+    //   2. `users_roles_need_a_grant` — a DEFERRED constraint trigger on `users`. A row that GAINS
+    //      a privileged role is refused at COMMIT unless a `platform_role_grants` row for that user
+    //      and that role was written **in the same transaction**. So the bare update above now
+    //      fails, and the only way to succeed is to write the audit record with the promotion.
+    //
+    //      Same-transaction rather than merely "some grant row exists", and the difference is a
+    //      real hole rather than pedantry: with the weaker rule, an administrator who is demoted
+    //      can be re-promoted for ever afterwards on the strength of the row that authorised the
+    //      first promotion — one approval, unlimited grants. `granted_at` defaults to
+    //      `transaction_timestamp()` and the trigger compares against `transaction_timestamp()`,
+    //      which is one value for the whole transaction and a different one in the next.
+    //
+    //      Deferred so the grant and the promotion may be written in either order. It fires only
+    //      on roles the row did not already hold, so REMOVING a role never needs a grant — a
+    //      control that could block a revocation would be a liability during an incident, not a
+    //      safeguard.
+    //
+    //   3. `platform_role_grants_immutable` — the grant table is append-only. Without it the
+    //      one-shot index is re-armable: `delete from platform_role_grants where source =
+    //      'bootstrap'` and the whole property is gone. It also means a promotion cannot be
+    //      un-recorded after the fact.
+    //
+    // **The honest limit.** The database owner can `alter table ... disable trigger` or drop an
+    // index; nothing in a schema survives its own superuser. What this buys is that every one of
+    // those is a deliberate, loud, separate act that leaves DDL behind, rather than an UPDATE that
+    // looks like every other UPDATE. That is the same floor every constraint in this estate has.
+    //
+    // ## The bootstrap, in its correct shape
+    //
+    // The runbook step becomes ONE transaction — `micro-deploy` owns the script:
+    //
+    //     begin;
+    //     insert into platform_role_grants (user_id, role, source, actor, reason)
+    //     select id, 'admin', 'bootstrap', 'estate-bootstrap.sh',
+    //            'first operator of this environment; no approval queue can exist before one'
+    //       from users where email = lower(btrim('<the operator>'));
+    //     update users set roles = array['player','admin']
+    //      where email = lower(btrim('<the operator>'));
+    //     commit;
+    //
+    // Run it twice and the second run fails at 23505 on the insert, before the update is even
+    // attempted, and the transaction rolls back. That is the procedure's own assertion.
+    //
+    // ## What an already-bootstrapped environment does
+    //
+    // Nothing, deliberately. The trigger fires on roles a row GAINS, so existing administrators are
+    // undisturbed and no backfill is attempted — a backfill would have to invent an actor and a
+    // reason, and if such an environment had two administrators a backfill claiming both were
+    // bootstrapped would fail this migration at the index. What changes for an existing environment
+    // is only that no NEW administrator can appear without a row.
+    up: `
+      create table if not exists platform_role_grants (
+        id          uuid        primary key default gen_random_uuid(),
+        -- No ON DELETE action. A grant is the audit record of a promotion, and a cascade would let
+        -- deleting the user erase the record of it. Nothing in this service deletes a user row —
+        -- deletion.ts tombstones in place, precisely so rows keyed on a user id survive erasure.
+        user_id     uuid        not null references users (id),
+        role        text        not null,
+        -- 'bootstrap' is the one grant that answers to nothing, because nothing exists yet to
+        -- answer to. 'approval' is every one after it, and carries two operators' signatures out of
+        -- admin-api's queue in the form of the approval id.
+        source      text        not null,
+        approval_id uuid,
+        actor       text        not null,
+        reason      text        not null,
+        granted_at  timestamptz not null default transaction_timestamp(),
+        constraint platform_role_grants_source_known
+          check (source in ('bootstrap', 'approval')),
+        -- An equality, not two implications: 'approval' without an id is an unauthorised grant
+        -- wearing the authorised source, and 'bootstrap' WITH one is a claim that the first
+        -- administrator was approved by a queue that could not have existed.
+        constraint platform_role_grants_approval_pairing
+          check ((source = 'approval') = (approval_id is not null)),
+        -- The privileged set, and it is the same list the trigger below carries. 'player' is not
+        -- here: it is the default every account gets at registration, and requiring a grant row for
+        -- it would mean a grant per user and a bootstrap collision on the second registration.
+        constraint platform_role_grants_role_known check (role in ('admin')),
+        constraint platform_role_grants_actor_present check (btrim(actor) <> ''),
+        constraint platform_role_grants_reason_present check (btrim(reason) <> '')
+      );
+
+      -- ONE bootstrap grant per database, for ever. The second insert raises 23505 from any client.
+      create unique index if not exists platform_role_grants_one_bootstrap
+        on platform_role_grants (source) where source = 'bootstrap';
+
+      create index if not exists platform_role_grants_user_idx
+        on platform_role_grants (user_id, granted_at desc);
+
+      -- Append-only. Without this the one-shot index above is re-armable by a DELETE.
+      create or replace function platform_role_grants_append_only() returns trigger
+      language plpgsql as $fn$
+      begin
+        raise exception
+          using errcode = 'check_violation',
+                message = 'platform_role_grants is append-only: ' || tg_op || ' is refused',
+                hint = 'withdraw a role by removing it from users.roles; the grant row is the record that it was ever held';
+      end;
+      $fn$;
+
+      drop trigger if exists platform_role_grants_immutable on platform_role_grants;
+      create trigger platform_role_grants_immutable
+        before update or delete on platform_role_grants
+        for each row execute function platform_role_grants_append_only();
+
+      -- No privileged role without a grant row written in the SAME transaction.
+      create or replace function users_roles_need_a_grant() returns trigger
+      language plpgsql as $fn$
+      declare
+        privileged constant text[] := array['admin'];
+        gained      text[];
+        gained_role text;
+      begin
+        -- Roles the row did not already hold. Losing a role is always permitted: a guard that could
+        -- block a revocation is a liability in an incident rather than a safeguard.
+        select array(
+          select r
+            from unnest(coalesce(new.roles, '{}'::text[])) as t(r)
+           where r = any (privileged)
+             and (tg_op = 'INSERT' or not (r = any (coalesce(old.roles, '{}'::text[]))))
+        ) into gained;
+
+        foreach gained_role in array gained loop
+          if not exists (
+            select 1
+              from platform_role_grants g
+             where g.user_id = new.id
+               and g.role = gained_role
+               -- transaction_timestamp() is constant for the life of a transaction and is what
+               -- granted_at defaults to, so this is exactly "written by whoever is promoting".
+               -- A grant from an earlier transaction authorises nothing, which is what stops one
+               -- approval from being spent twice.
+               and g.granted_at = transaction_timestamp()
+          ) then
+            raise exception
+              using errcode = 'check_violation',
+                    message = 'user ' || new.id || ' gained the platform role ' || gained_role ||
+                              ' with no platform_role_grants row written in the same transaction',
+                    hint = 'insert the grant row and update users.roles in ONE transaction: source ''bootstrap'' once per database, or ''approval'' carrying an approval id';
+          end if;
+        end loop;
+        return null;
+      end;
+      $fn$;
+
+      drop trigger if exists users_roles_need_a_grant on users;
+      -- DEFERRABLE INITIALLY DEFERRED: the grant and the promotion may be written in either order,
+      -- and a bare 'update users set roles = ...' therefore fails at COMMIT rather than at the
+      -- statement — which is the same answer, from the layer that an attacker with a connection
+      -- cannot step around.
+      create constraint trigger users_roles_need_a_grant
+        after insert or update of roles on users
+        deferrable initially deferred
+        for each row execute function users_roles_need_a_grant();
+    `,
+  },
 ]
 
 /**

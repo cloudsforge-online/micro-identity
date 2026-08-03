@@ -63,6 +63,7 @@ export const EMITTED_TOPICS = Object.freeze([
   'identity.device.added',
   'identity.mfa.added',
   'identity.mfa.removed',
+  'identity.role.changed',
 ] as const)
 
 /** The only strings `emit` will accept. Anything else is a compile error at the call site. */
@@ -92,17 +93,27 @@ export interface ProposedTopic {
  * described here instead of registered there.
  */
 export const AWAITING_REGISTRATION: Readonly<Record<string, ProposedTopic>> = Object.freeze({
-  // EMPTY, AND THAT IS THE QUARANTINE WORKING RATHER THAN A GAP.
-  //
   // `identity.session.revoked` and `identity.mfa.added` were both described here because
   // micro-contracts was owned by another agent at the time. It has since adopted both —
   // contracts/packages/events/src/index.ts:263 and :291 — so `isRegisteredTopic` now answers true
   // for each, and the test that asserts every entry is GENUINELY absent from the registry failed
   // until they were deleted. That is the third property in the doc above doing exactly what it
   // promised: the quarantine empties itself rather than rotting into a permanent allow-list.
-  //
-  // Nothing else changes. Both topics stay in `EMITTED_TOPICS`; they are simply named by the shared
-  // registry now instead of by a proposal here.
+  'identity.role.changed': {
+    reason:
+      "A platform role was granted or withdrawn — the single most consequential write in the estate, and until migration 12 the only one with no trail at all. SD-15's Identity row asks for it and admin-api's operator log is fed by the bus (admin-api/src/server.ts:510, the audit mirror), so a promotion that never reaches a topic is a promotion the estate audit of record cannot show. Every event carries the approval id, which is two operators' signatures out of admin-api's four-eyes queue; the bootstrap grant is the one promotion that predates any queue and is emitted by nothing, because it is written by a human against the database before this service is trusted to act.",
+    spec: {
+      producer: 'identity',
+      payloadType: 'PlatformRolesChanged',
+      version: '1.0',
+      // The person whose authority changed, not the approval — `activity` reads the owner straight
+      // off the key for identity topics, and ordering is per key, so two changes to one account
+      // must be ordered with respect to each other.
+      keyedBy: 'user_id',
+      description:
+        "A user's platform roles changed, carrying the roles gained and lost and the approval id that authorised them.",
+    },
+  },
 })
 
 /**

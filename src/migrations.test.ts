@@ -67,6 +67,7 @@ test('every table the service reads or writes is created', () => {
     'password_reset_tokens',
     'auth_exchange_codes',
     'service_token_issues',
+    'platform_role_grants',
   ]) {
     assert.match(sql, new RegExp(`create table if not exists ${table}\\b`), `${table} is missing`)
   }
@@ -155,6 +156,86 @@ test('ORGANISATIONS: the roles are the closed set, and the owner rule is NOT a t
   // in organisations.ts, under a lock.
   const organisations = MIGRATIONS.find((m) => m.name === 'organisations')!
   assert.doesNotMatch(statementsOf(organisations.up), /owner_count|at_least_one_owner/)
+})
+
+/* ---------------------------------------------------- the first administrator (migration 12) */
+
+/*
+ * These are text assertions and they are the weaker half deliberately.
+ *
+ * `platformRoles.test.ts` proves the behaviour against a real Postgres — a second bootstrap
+ * refused, an unapproved promotion refused, both from a raw connection. What CANNOT be proved there
+ * is an absence: that nobody has quietly softened the DDL in a way that leaves the behaviour intact
+ * on the happy paths the suite happens to walk. That is what these read.
+ */
+
+const roleGrants = MIGRATIONS.find((m) => m.name === 'platform_role_grants')!
+
+test('BOOTSTRAP: one grant with source=bootstrap per database, enforced by a PARTIAL unique index', () => {
+  // The whole security property. A unique index on `source` alone would cap approved grants at one
+  // as well, which would make a second administrator impossible — and four-eyes approval needs two.
+  assert.match(
+    roleGrants.up,
+    /create unique index if not exists platform_role_grants_one_bootstrap\s+on platform_role_grants \(source\) where source = 'bootstrap';/,
+  )
+  // Capping ADMINISTRATORS is the mistake this design exists to avoid, so nothing may constrain
+  // users.roles by count.
+  assert.doesNotMatch(statementsOf(roleGrants.up), /one_admin|admin_count|count\(\*\) *[<=]/)
+})
+
+test('BOOTSTRAP: the promotion guard is a DEFERRED constraint trigger, not a CHECK and not a handler', () => {
+  // A CHECK cannot reference another table, and a non-deferred trigger would dictate statement
+  // order inside the transaction. Both facts are why this is the shape it is.
+  assert.match(
+    roleGrants.up,
+    /create constraint trigger users_roles_need_a_grant\s+after insert or update of roles on users\s+deferrable initially deferred/,
+  )
+  // INSERT as well as UPDATE: a row created already privileged would otherwise walk past it.
+  assert.match(roleGrants.up, /after insert or update of roles on users/)
+})
+
+test('BOOTSTRAP: the grant must be written in the SAME transaction as the promotion', () => {
+  // Without this clause a demoted administrator is re-promotable for ever on the row that
+  // authorised the first promotion — one approval, unlimited grants.
+  assert.match(roleGrants.up, /g\.granted_at = transaction_timestamp\(\)/)
+  assert.match(roleGrants.up, /granted_at  timestamptz not null default transaction_timestamp\(\)/)
+})
+
+test('BOOTSTRAP: the grant table is append-only, so the one-shot cannot be re-armed', () => {
+  assert.match(
+    roleGrants.up,
+    /create trigger platform_role_grants_immutable\s+before update or delete on platform_role_grants/,
+  )
+})
+
+test('BOOTSTRAP: an approval grant carries an approval id and a bootstrap grant does not', () => {
+  // An equality rather than two implications: `source='approval'` with a null id is an
+  // unauthorised grant wearing the authorised source.
+  assert.match(
+    roleGrants.up,
+    /platform_role_grants_approval_pairing\s+check \(\(source = 'approval'\) = \(approval_id is not null\)\)/,
+  )
+  assert.match(roleGrants.up, /platform_role_grants_source_known\s+check \(source in \('bootstrap', 'approval'\)\)/)
+  // Neither may be blank. An audit row with no actor and no reason records that something happened
+  // and nothing about who or why, which is the state migration 12 exists to leave behind.
+  assert.match(roleGrants.up, /platform_role_grants_actor_present check \(btrim\(actor\) <> ''\)/)
+  assert.match(roleGrants.up, /platform_role_grants_reason_present check \(btrim\(reason\) <> ''\)/)
+})
+
+test('BOOTSTRAP: the privileged set in the CHECK and in the trigger are the same list', () => {
+  // Three copies of one list — here twice, and PRIVILEGED_ROLES in platformRoles.ts. The two in the
+  // DDL are compared here; platformRoles.test.ts compares the module's against the database's.
+  assert.match(roleGrants.up, /platform_role_grants_role_known check \(role in \('admin'\)\)/)
+  assert.match(roleGrants.up, /privileged constant text\[\] := array\['admin'\]/)
+  // `player` is every account's default. A grant requirement on it would spend the one-per-database
+  // bootstrap slot on somebody's sign-up and refuse every registration after the first.
+  assert.doesNotMatch(statementsOf(roleGrants.up), /array\['admin', ?'player'\]|role in \('admin', ?'player'\)/)
+})
+
+test('BOOTSTRAP: the grant survives its user — no cascade erases the record of a promotion', () => {
+  assert.match(roleGrants.up, /user_id     uuid        not null references users \(id\),/)
+  const statements = statementsOf(roleGrants.up)
+  assert.ok(!statements.includes('on delete cascade'), 'a cascade would delete the audit trail')
 })
 
 test('nothing stores a credential in the clear', () => {

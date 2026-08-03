@@ -12,6 +12,7 @@ import {
   enabled,
   freshEmail,
   freshHandle,
+  grantAdmin,
   migrateTestDb,
   openDb,
   resetIdentity,
@@ -21,6 +22,7 @@ import { before, after, beforeEach, test } from 'node:test'
 import assert from 'node:assert/strict'
 import type { Server } from 'node:http'
 import type { AddressInfo } from 'node:net'
+import { randomUUID } from 'node:crypto'
 import { decodeJwt } from 'jose'
 import { Lifecycle } from '@cloudsforge/lifecycle'
 import { Logger, Metrics, registerHttpMetrics, registerJobMetrics } from '@cloudsforge/telemetry'
@@ -578,9 +580,18 @@ test('changing a password keeps the calling session and ends the others', { skip
 
 /* ------------------------------------------------------------------ service tokens */
 
+/**
+ * An operator, promoted the way the estate now has to promote one.
+ *
+ * This used to be a bare `update users set roles = '{player,admin}'`, and migration 12 refuses it:
+ * the deferred trigger fires at the implicit commit of that one statement and raises 23514, so the
+ * whole service suite went red the moment the guard landed. That failure is the guard working
+ * rather than a harness problem — the statement it refused is character for character the one
+ * `deploy/scripts/estate-bootstrap.sh:102` runs, which is the defect being closed.
+ */
 async function makeAdmin(): Promise<string> {
   const registered = await register()
-  await sql`update users set roles = '{player,admin}' where id = ${registered.userId}`
+  await grantAdmin(sql, registered.userId)
   const login = await call('POST', '/auth/login', {
     body: { identifier: registered.email, password: GOOD_PASSWORD },
   })
@@ -683,6 +694,167 @@ test('a service token is refused where a user token is required', { skip }, asyn
   // `sub` — a service name — look like a user id to every lookup after it.
   const response = await call('GET', '/auth/me', { token: issued.body['token'] as string })
   assert.equal(response.status, 403)
+})
+
+/* ------------------------------------------------------------------ platform roles */
+
+/**
+ * A service token for admin-api holding `identity:admin`, minted the real way.
+ *
+ * Not a hand-built principal. `parseServiceGrants` refuses an unknown scope at import
+ * (`env.ts:141`), so a token that comes out of this function is proof that `identity:admin` is in
+ * the contracts registry and that identity can actually mint it — which is the half a fake
+ * principal cannot prove, and the half that was missing from thirty-nine scopes estate-wide.
+ */
+async function adminApiToken(scopes: string[] = ['identity:admin']): Promise<string> {
+  const admin = await makeAdmin()
+  const issued = await call('POST', '/service-tokens', {
+    token: admin,
+    body: { service: 'admin-api', scopes },
+  })
+  assert.equal(issued.status, 201, JSON.stringify(issued.body))
+  return issued.body['token'] as string
+}
+
+test('the route admin-api answers 501 without: a service token holding identity:admin promotes', { skip }, async () => {
+  const subject = await register()
+  const token = await adminApiToken()
+  const approvalId = randomUUID()
+
+  const response = await call('PUT', `/internal/users/${subject.userId}/roles`, {
+    token,
+    body: {
+      roles: ['player', 'admin'],
+      actor: 'operator:ada',
+      reason: 'approved by two operators in the queue',
+      approvalId,
+    },
+  })
+  assert.equal(response.status, 200, JSON.stringify(response.body))
+  assert.deepEqual(response.body['granted'], ['admin'])
+
+  // The promotion is real, and it carries its authorisation.
+  const me = await call('POST', '/auth/login', {
+    body: { identifier: subject.email, password: GOOD_PASSWORD },
+  })
+  assert.deepEqual(decodeJwt(me.body['accessToken'] as string)['roles'], ['admin', 'player'])
+
+  const grants = await call('GET', `/internal/users/${subject.userId}/role-grants`, { token })
+  assert.equal(grants.status, 200)
+  const rows = grants.body['grants'] as Array<Record<string, unknown>>
+  assert.equal(rows.length, 1)
+  assert.equal(rows[0]?.['source'], 'approval')
+  assert.equal(rows[0]?.['approvalId'], approvalId)
+})
+
+test('the promotion route refuses an operator token, a scopeless service token and no token', { skip }, async () => {
+  const subject = await register()
+  const body = {
+    roles: ['player', 'admin'],
+    actor: 'operator:ada',
+    reason: 'straight to the promotion, skipping the queue',
+    approvalId: randomUUID(),
+  }
+  const path = `/internal/users/${subject.userId}/roles`
+
+  // An operator's OWN token, which is the one that reads like it ought to work. It must not: a
+  // human who can promote directly is one pair of eyes on the estate's most consequential write,
+  // which is exactly what admin-api's four-eyes queue exists to prevent.
+  const operator = await makeAdmin()
+  assert.equal((await call('PUT', path, { token: operator, body })).status, 403)
+
+  // A service token for a service that holds a different scope entirely.
+  const wrongScope = await call('POST', '/service-tokens', {
+    token: operator,
+    body: { service: 'settlement', scopes: ['ledger:read'] },
+  })
+  assert.equal(
+    (await call('PUT', path, { token: wrongScope.body['token'] as string, body })).status,
+    403,
+  )
+
+  assert.equal((await call('PUT', path, { body })).status, 401)
+
+  // None of the three wrote anything.
+  const login = await call('POST', '/auth/login', {
+    body: { identifier: subject.email, password: GOOD_PASSWORD },
+  })
+  assert.deepEqual(decodeJwt(login.body['accessToken'] as string)['roles'], ['player'])
+})
+
+test('the approval id is required, not optional — an unapproved promotion is a 400', { skip }, async () => {
+  // An optional approval id would make the unapproved promotion the easy call and the approved one
+  // the careful call, which is the wrong way round for the only route in the estate that can mint
+  // an administrator.
+  const subject = await register()
+  const token = await adminApiToken()
+  const path = `/internal/users/${subject.userId}/roles`
+
+  assert.equal(
+    (await call('PUT', path, {
+      token,
+      body: { roles: ['player', 'admin'], actor: 'operator:ada', reason: 'no approval' },
+    })).status,
+    400,
+  )
+  assert.equal(
+    (await call('PUT', path, {
+      token,
+      body: {
+        roles: ['player', 'admin'],
+        actor: 'operator:ada',
+        reason: 'not a uuid',
+        approvalId: 'approval-7',
+      },
+    })).status,
+    400,
+  )
+  assert.equal(
+    (await call('PUT', path, {
+      token,
+      body: {
+        roles: ['player', 'superuser'],
+        actor: 'operator:ada',
+        reason: 'inventing a role',
+        approvalId: randomUUID(),
+      },
+    })).status,
+    400,
+  )
+})
+
+test('the route cannot spend the bootstrap slot, whatever it is asked for', { skip }, async () => {
+  // The property the whole design rests on: an environment gets exactly ONE administrator that
+  // answers to nothing, and this service is not able to create it. Every row this route writes says
+  // 'approval' and carries an id, so the one-per-database bootstrap grant stays where the runbook
+  // put it.
+  const first = await register()
+  const second = await register()
+  const token = await adminApiToken()
+
+  for (const subject of [first, second]) {
+    const response = await call('PUT', `/internal/users/${subject.userId}/roles`, {
+      token,
+      body: {
+        roles: ['player', 'admin'],
+        actor: 'operator:ada',
+        reason: 'both approved',
+        approvalId: randomUUID(),
+      },
+    })
+    assert.equal(response.status, 200, JSON.stringify(response.body))
+  }
+
+  // Three promotions have happened by now — the two above, plus the operator `adminApiToken` had to
+  // make to mint its token — and not one of them was able to write a bootstrap row.
+  const rows = await sql<{ source: string; n: number }[]>`
+    select source, count(*)::int as n from platform_role_grants group by source order by source
+  `
+  assert.deepEqual([...rows], [{ source: 'approval', n: 3 }], 'no bootstrap row exists, and none can')
+  const bootstrapped = await sql<{ n: number }[]>`
+    select count(*)::int as n from platform_role_grants where source = 'bootstrap'
+  `
+  assert.equal(bootstrapped[0]?.n, 0, 'the slot the runbook owns is still unspent')
 })
 
 /* ------------------------------------------------------------------ the hand-off */

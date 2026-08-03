@@ -38,6 +38,11 @@
  *   `identity.mfa.added`        — a second factor was activated, or an existing one replaced.
  *   `identity.mfa.removed`      — a factor was revoked, carrying whether it was the last active
  *                                 one. That case emits with `critical: true`.
+ *   `identity.role.changed`     — a platform role was granted or withdrawn, carrying the approval
+ *                                 id that authorised it. Written in the same transaction as the
+ *                                 `platform_role_grants` row and the `users.roles` update, because
+ *                                 migration 12's deferred trigger refuses the update otherwise —
+ *                                 so the trail cannot be skipped by a handler that forgets it.
  */
 
 import { EVENT_ID_HEADER, SIGNATURE_HEADER, signDelivery, verifyDelivery } from '@cloudsforge/contracts-events'
