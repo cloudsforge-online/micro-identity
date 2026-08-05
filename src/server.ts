@@ -79,6 +79,7 @@ import {
 import {
   RESET_REQUEST_STATUS,
   deliverPasswordReset,
+  peekPasswordResetToken,
   redeemPasswordResetToken,
   revokePasswordResetTokens,
 } from './passwordReset.ts'
@@ -1290,7 +1291,11 @@ function buildRoutes(): Route[] {
       const token = requireString(body, 'token')
       const newPasswordRaw = requireString(body, 'newPassword')
 
-      const userId = await redeemPasswordResetToken(deps.sql, token)
+      // IDENTIFY, VALIDATE, THEN SPEND — in that order, and the order is the point. This redeemed
+      // first, so a password the policy refused answered 400 against a link it had already
+      // destroyed, and the retry that 400 invites answered 401 for ever. See
+      // `peekPasswordResetToken` for why a peek does not weaken single use.
+      const userId = await peekPasswordResetToken(deps.sql, token)
       if (!userId) {
         // Expired, already spent, or never real. All three read the same way to the person holding
         // it, and separating them would say whether a guessed token had ever existed.
@@ -1302,6 +1307,13 @@ function buildRoutes(): Route[] {
 
       const checked = checkPassword(newPasswordRaw, { handle: user.handle, email: user.email }, 'newPassword')
       if (!checked.ok) throw new BadRequestError('that password is not acceptable', [...checked.errors])
+
+      // Spent now, and only now. Still the one atomic gate: two requests that both peeked and both
+      // validated race here, and the conditional update still has exactly one winner.
+      if ((await redeemPasswordResetToken(deps.sql, token)) !== user.id) {
+        ctx.log.warn('password reset token rejected')
+        throw new UnauthenticatedError('that reset link is invalid or has expired')
+      }
 
       await setPassword(deps.sql, user.id, checked.value)
       // SD-04: spending a reset revokes every refresh family. No session is kept — whoever forced

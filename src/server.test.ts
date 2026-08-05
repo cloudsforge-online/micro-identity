@@ -804,6 +804,47 @@ test('spending a reset sets the password and revokes every session', { skip }, a
   )
 })
 
+/**
+ * **A password the policy refuses must not burn the link.**
+ *
+ * The route redeemed the token and only then judged the new password, so a weak choice answered 400
+ * against a link that was already spent, and the retry the 400 explicitly invites answered 401.
+ * The user is told "that password is not acceptable", picks a better one, and is then told their
+ * reset link is invalid — with no way to tell that their own first attempt destroyed it. The only
+ * repair available to them is to ask for another mail, which is also how one person's typo turns
+ * into the estate mailing them repeatedly.
+ *
+ * Validating first is safe because the redemption is still the single-use gate: it is a conditional
+ * `update ... returning`, so two requests that both pass validation still leave exactly one winner.
+ */
+test('a rejected password leaves the reset link usable', { skip }, async () => {
+  const registered = await register()
+  const { createPasswordResetToken } = await import('./passwordReset.ts')
+  const issued = await createPasswordResetToken(db, registered.userId, null)
+
+  const refused = await call('POST', '/auth/password/reset', {
+    body: { token: issued.token, newPassword: 'short' },
+  })
+  assert.equal(refused.status, 400)
+  // NOT 401 on the retry. This is the whole test.
+  const accepted = await call('POST', '/auth/password/reset', {
+    body: { token: issued.token, newPassword: OTHER_PASSWORD },
+  })
+  assert.equal(accepted.status, 204, 'a refused password must not have spent the link')
+
+  // And it is spent now, exactly once.
+  assert.equal(
+    (await call('POST', '/auth/password/reset', { body: { token: issued.token, newPassword: OTHER_PASSWORD } }))
+      .status,
+    401,
+  )
+  assert.equal(
+    (await call('POST', '/auth/login', { body: { identifier: registered.email, password: OTHER_PASSWORD } }))
+      .status,
+    200,
+  )
+})
+
 test('changing a password keeps the calling session and ends the others', { skip }, async () => {
   const registered = await register()
   const other = await call('POST', '/auth/login', {

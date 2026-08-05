@@ -145,6 +145,40 @@ export function resetUrlFor(token: string): string | null {
   return buildResetUrl(env.accountUrl, token)
 }
 
+/**
+ * The account a live token belongs to, WITHOUT spending it.
+ *
+ * ## Why the route needs this, and what it cost not to have it
+ *
+ * The new password cannot be judged until the account is known — `checkPassword` compares it
+ * against the handle and the address, which is the check that stops somebody resetting to their own
+ * email — and the only thing the request carries that names an account is the token. So the route
+ * used to redeem first and validate second, and a password the policy refused therefore answered
+ * 400 having ALREADY destroyed the link that carried it. The retry that the 400 explicitly invites
+ * answered 401, with nothing to tell the user that their own first attempt was what killed it. The
+ * only repair available to them is to request another mail, which is also the loop that has the
+ * estate mail one person repeatedly because they picked a short password once.
+ *
+ * ## Why this does not weaken single use
+ *
+ * A peek is not a use, and the gate is unchanged: `redeemPasswordResetToken` is still a conditional
+ * `update ... returning` and still the only thing that spends anything. Two requests that both peek
+ * successfully and both pass validation still race on that update, and it still has exactly one
+ * winner — the loser is refused, as it was before. What has moved is only the point at which a
+ * REJECTED request stops, and a request that is going to be rejected must not consume the
+ * credential it was rejected for.
+ *
+ * Same predicate as the redemption, deliberately: a peek that accepted a token the redemption would
+ * refuse would be a way to ask whether a spent or expired token had ever been real.
+ */
+export async function peekPasswordResetToken(sql: Db, token: string): Promise<string | null> {
+  const rows = await sql<{ user_id: string }[]>`
+    select user_id from password_reset_tokens
+     where token_hash = ${hashToken(token)} and used_at is null and expires_at > now()
+  `
+  return rows[0]?.user_id ?? null
+}
+
 /** Redeem a reset token exactly once. Returns the user id, or null. */
 export async function redeemPasswordResetToken(sql: Db, token: string): Promise<string | null> {
   const rows = await sql<{ user_id: string }[]>`

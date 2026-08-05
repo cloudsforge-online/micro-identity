@@ -37,6 +37,7 @@ import {
   buildResetUrl,
   createPasswordResetToken,
   deliverPasswordReset,
+  peekPasswordResetToken,
   redeemPasswordResetToken,
   requestPasswordReset,
   resetUrlFor,
@@ -188,6 +189,40 @@ test('two redemptions racing on one link: exactly one wins', { skip }, async () 
     redeemPasswordResetToken(db, token),
   ])
   assert.deepEqual(results.filter((r) => r !== null), [user.id], 'exactly one redemption may win')
+})
+
+/**
+ * **Looking at a token must not spend it.**
+ *
+ * The route has to know WHOSE account it is before it can judge the new password — the strength
+ * check compares against the handle and the address — and the only way to learn that is from the
+ * token. Doing it with the redemption meant a password the policy refused had already destroyed
+ * the link that carried it: 400, and the retry the 400 invites answers 401 for ever. Every user who
+ * picked a weak password lost their reset and had to ask for another one, which is also the loop
+ * that makes an estate mail the same person repeatedly.
+ */
+test('peeking identifies the account WITHOUT spending the link', { skip }, async () => {
+  const user = await newUser()
+  const { token } = await createPasswordResetToken(db, user.id, null)
+
+  assert.equal(await peekPasswordResetToken(db, token), user.id)
+  assert.equal(await peekPasswordResetToken(db, token), user.id, 'peeking is not a use')
+  assert.equal((await liveTokens(user.id)).length, 1, 'the link is still live after two peeks')
+  // And the redemption still works exactly once afterwards, so the peek has not weakened the gate.
+  assert.equal(await redeemPasswordResetToken(db, token), user.id)
+  assert.equal(await redeemPasswordResetToken(db, token), null)
+})
+
+test('a peek is refused for a spent or expired link, exactly as a redemption is', { skip }, async () => {
+  const user = await newUser()
+  const spent = await createPasswordResetToken(db, user.id, null)
+  await redeemPasswordResetToken(db, spent.token)
+  assert.equal(await peekPasswordResetToken(db, spent.token), null)
+
+  const expiring = await createPasswordResetToken(db, user.id, null)
+  await sql`update password_reset_tokens set expires_at = now() - interval '1 second'`
+  assert.equal(await peekPasswordResetToken(db, expiring.token), null)
+  assert.equal(await peekPasswordResetToken(db, 'never-a-real-token'), null)
 })
 
 /* ------------------------------------------------------------------ expiry */
