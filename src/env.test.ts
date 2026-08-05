@@ -9,16 +9,43 @@
 import './testsupport.ts'
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { randomBytes } from 'node:crypto'
 import { readFileSync } from 'node:fs'
 import { EnvError, loadEnv, parseServiceGrants } from './env.ts'
 
-/** The smallest source that boots. Every case below removes or corrupts exactly one thing. */
+/**
+ * A secret fixture, GENERATED rather than written down.
+ *
+ * `openssl rand -base64 48` is what the runbook tells an operator to run; this is the same 48
+ * bytes, and every call returns a different one. Using it rather than a literal is what stops a
+ * placeholder creeping back the next time somebody needs a fixture — which is not hypothetical:
+ * every secret literal that used to be in this file was one.
+ */
+function generated(): string {
+  return randomBytes(48).toString('base64')
+}
+
+/**
+ * The smallest source that boots. Every case below removes or corrupts exactly one thing.
+ *
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * THE TWO SECRETS HERE WERE `a-real-key-secret-with-enough-entropy-1234` AND
+ * `a-real-outbox-signing-secret-1234`, AND THEY NAMED THEMSELVES ACCURATELY IN THE WRONG DIRECTION.
+ *
+ * Both are hand-typed and hyphenated, which is exactly the shape of micro-org #142's
+ * `estate-only-outbox-secret-00000000000000` — 40 characters, past every floor this file enforced,
+ * and on nobody's deny-list. Every case below ran against them, so the suite as a whole asserted
+ * that a value of that shape is a valid secret for the service that holds the estate's universal
+ * forging key. "with-enough-entropy" was a claim, not a measurement; the shape check is the
+ * measurement, and it refuses both.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
 const COMPLETE: Readonly<Record<string, string>> = {
   IDENTITY_DATABASE_URL: 'postgres://cloudsforge@127.0.0.1:5432/identity',
   IDENTITY_ISSUER: 'https://identity.cloudsforge.local',
-  IDENTITY_KEY_SECRET: 'a-real-key-secret-with-enough-entropy-1234',
+  IDENTITY_KEY_SECRET: generated(),
   IDENTITY_PUBLIC_URL: 'https://account.cloudsforge.local',
-  OUTBOX_SIGNING_SECRET: 'a-real-outbox-signing-secret-1234',
+  OUTBOX_SIGNING_SECRET: generated(),
 }
 
 test('a complete source loads, and the defaults are the ones documented', () => {
@@ -45,43 +72,97 @@ test('every required variable names itself when it is missing', () => {
   }
 })
 
-test('a known placeholder is refused outright, for both secrets', () => {
+test('a placeholder is refused outright, for both secrets, whatever it was padded out with', () => {
   // The last two are the exact strings THIS REPOSITORY'S `.env.example` shipped, and both used to
   // boot: 37 and 32 characters, so they cleared the length floor, and neither is one of the eight
   // exact placeholder strings, so they cleared the placeholder check. A deployer who edits every
   // line except the one whose entire purpose is to be edited got a running service whose forging
   // key is a literal in a committed file — and that key mints a token for any user and any service
   // in the estate. Padding a placeholder out to clear a length check must not be how it passes.
+  //
+  // The last entry is the one the deny-list never had a chance against: it is not `CHANGE_ME`, it
+  // does not BEGIN with a stem, and it is 40 characters. It is the value that actually reached 44
+  // containers on both networks (micro-org #142), and it is here so that the case this whole change
+  // exists for is a case rather than an anecdote.
   const refused = [
     'changeme',
     'CHANGE_ME',
     'change-me-please-this-is-long-enough-ok',
     'CHANGE_ME_at_least_32_characters_long',
     'CHANGE_ME_at_least_24_characters',
+    'estate-only-outbox-secret-00000000000000',
   ]
   for (const name of ['IDENTITY_KEY_SECRET', 'OUTBOX_SIGNING_SECRET']) {
     for (const value of refused) {
       assert.throws(
         () => loadEnv({ ...COMPLETE, [name]: value }),
-        /known placeholder/,
+        // WAS `/known placeholder/`, which pinned one branch's exact wording — the branch that only
+        // fires for an EXACT match against a list. Three of the six values above are refused by the
+        // marker check or the alphabet check and produce different, better messages. Asserting on
+        // the class and the variable rather than the sentence lets the guard improve its answer
+        // without this file calling that a regression.
+        (err: unknown) =>
+          err instanceof EnvError && err.message.includes(name) && !err.message.includes(value),
         `${name} accepted the placeholder ${value}`,
       )
     }
   }
-  // And it stays a placeholder check rather than becoming a substring ban: a real secret is allowed
-  // to contain these letters anywhere but the start.
-  assert.doesNotThrow(() =>
-    loadEnv({ ...COMPLETE, IDENTITY_KEY_SECRET: 'a-real-secret-nobody-would-change-me-1234' }),
-  )
 })
 
-test('the key secret is held to a longer minimum than everything else', () => {
-  // It wraps the RS256 private half, which is the estate's universal forging credential — every
-  // service verifies iss plus aud and nothing more. Twenty-four characters is the general bar; this
-  // one is 32.
-  const twentyEight = 'x'.repeat(28)
-  assert.doesNotThrow(() => loadEnv({ ...COMPLETE, OUTBOX_SIGNING_SECRET: twentyEight }))
-  assert.throws(() => loadEnv({ ...COMPLETE, IDENTITY_KEY_SECRET: twentyEight }), /at least 32/)
+test('both secrets are held to the SAME rule, and the unit is BYTES rather than keystrokes', () => {
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  // THIS TEST REPLACES `the key secret is held to a longer minimum than everything else`, WHICH WAS
+  // DEFENDING THE DEFECT IN TWO SEPARATE WAYS.
+  //
+  //   1. It asserted `doesNotThrow` on `'x'.repeat(28)` for OUTBOX_SIGNING_SECRET. Twenty-eight
+  //      identical characters is not a secret by any measure — it is 21 bytes of key material with
+  //      zero entropy — and the suite required that it LOAD. Any fix that refused it failed CI.
+  //   2. It pinned the message `/at least 32/`, which is the keystroke floor this work replaces.
+  //
+  // The asymmetry it was expressing — the key secret matters more than the outbox key — is real,
+  // and it is now expressed by both being held to 32 BYTES, which is stricter than either floor was.
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  for (const name of ['IDENTITY_KEY_SECRET', 'OUTBOX_SIGNING_SECRET']) {
+    assert.throws(
+      () => loadEnv({ ...COMPLETE, [name]: 'x'.repeat(28) }),
+      (err: unknown) =>
+        err instanceof EnvError &&
+        /21 bytes of key material/.test(err.message) &&
+        err.message.includes(name),
+      name,
+    )
+    // Long, well-formed and degenerate. Only a measurement of the value itself rejects these: all
+    // three are in an accepted alphabet and every one of them clears every length floor.
+    for (const degenerate of ['A'.repeat(64), '0'.repeat(64), 'deadbeef'.repeat(8)]) {
+      assert.throws(() => loadEnv({ ...COMPLETE, [name]: degenerate }), EnvError, `${name} ${degenerate}`)
+    }
+    // And the control that stops this becoming a guard somebody disables: what the runbook tells an
+    // operator to generate must load, in both encodings, every time.
+    for (let i = 0; i < 200; i += 1) {
+      assert.doesNotThrow(() => loadEnv({ ...COMPLETE, [name]: randomBytes(48).toString('base64') }))
+      assert.doesNotThrow(() => loadEnv({ ...COMPLETE, [name]: randomBytes(32).toString('hex') }))
+    }
+  }
+})
+
+test('THE GUARD HAS NO OFF SWITCH — no environment, no variable, no flag disables it', () => {
+  // The failure this replaces was a comment saying "change this in production". Anything that can
+  // be turned off is a comment with a longer name, and it would be reached for in exactly the hurry
+  // that produced the defect — so the escape hatches somebody would add are asserted absent here
+  // rather than merely not written.
+  for (const escape of [
+    { NODE_ENV: 'development' },
+    { NODE_ENV: 'test' },
+    { IDENTITY_ALLOW_WEAK_SECRETS: 'true' },
+    { IDENTITY_SKIP_SECRET_CHECKS: '1' },
+    { CI: 'true' },
+  ]) {
+    assert.throws(
+      () => loadEnv({ ...COMPLETE, ...escape, IDENTITY_KEY_SECRET: 'CHANGE_ME_at_least_32_characters_long' }),
+      EnvError,
+      JSON.stringify(escape),
+    )
+  }
 })
 
 test('the secret the test suite runs under is not itself a placeholder', () => {
@@ -104,7 +185,7 @@ test('the unsuffixed IDENTITY_KEY_SECRET is accepted as v1', () => {
 })
 
 test('the write version defaults to the highest secret supplied', () => {
-  const env = loadEnv({ ...COMPLETE, IDENTITY_KEY_SECRET_V2: 'a-second-key-secret-with-enough-entropy-99' })
+  const env = loadEnv({ ...COMPLETE, IDENTITY_KEY_SECRET_V2: generated() })
   assert.deepEqual([...env.keySecrets.keys()].sort((a, b) => a - b), [1, 2])
   // Adding a secret promotes the write version, so a rotation cannot stall half-done with the
   // service still sealing under the compromised key.
@@ -123,12 +204,11 @@ test('a write version with no matching secret refuses to boot', () => {
 test('two different values both claiming v1 refuse to boot rather than guessing', () => {
   // Guessing would silently pick the one that fails to open half the blobs, and the symptom would
   // arrive later, as an authentication failure a long way from its cause.
+  // GENERATED, not written: the old literal here was hyphenated, so under the shape rule
+  // `parseKeySecrets` would refuse it before it ever reached the conflict check, and this test
+  // would pass for the wrong reason.
   assert.throws(
-    () =>
-      loadEnv({
-        ...COMPLETE,
-        IDENTITY_KEY_SECRET_V1: 'a-different-v1-secret-with-enough-entropy-1',
-      }),
+    () => loadEnv({ ...COMPLETE, IDENTITY_KEY_SECRET_V1: generated() }),
     /are both set and differ/,
   )
   // The same value under both names is not a conflict — that is the intermediate state of renaming.
@@ -137,15 +217,25 @@ test('two different values both claiming v1 refuse to boot rather than guessing'
   )
 })
 
-test('a versioned key secret is held to the same floor and placeholder rules', () => {
-  assert.throws(
-    () => loadEnv({ ...COMPLETE, IDENTITY_KEY_SECRET_V2: 'x'.repeat(28) }),
-    /at least 32/,
-  )
-  assert.throws(
-    () => loadEnv({ ...COMPLETE, IDENTITY_KEY_SECRET_V2: 'CHANGE_ME_at_least_32_characters_long' }),
-    /known placeholder/,
-  )
+test('EVERY version is held to the full rule, including one retained only for a drain', () => {
+  // Not just the write version. A retained old secret still opens every blob that has not been
+  // re-sealed, so a placeholder kept "just for the drain" is the whole disclosure for as long as
+  // the drain takes — which makes draining off a placeholder work for the image that predates this
+  // guard, friction in exactly the right direction.
+  //
+  // The assertions were `/at least 32/` and `/known placeholder/`. The first pinned the keystroke
+  // floor this work replaces; the second pinned the one branch of the guard that a padded
+  // placeholder never reaches. Both are now assertions about the variable and the class.
+  for (const bad of ['x'.repeat(28), 'CHANGE_ME_at_least_32_characters_long', 'estate-only-key-000000000000000000000000']) {
+    assert.throws(
+      () => loadEnv({ ...COMPLETE, IDENTITY_KEY_SECRET_V2: bad }),
+      (err: unknown) =>
+        err instanceof EnvError &&
+        err.message.includes('IDENTITY_KEY_SECRET_V2') &&
+        !err.message.includes(bad),
+      bad,
+    )
+  }
 })
 
 test('an empty versioned secret is treated as unset and cannot silently downgrade writes', () => {
@@ -311,16 +401,23 @@ test('LOG_LEVEL is a closed set', () => {
 
 test('no error message can quote a secret', () => {
   // Every failure path names the VARIABLE. Quoting the value would put the secret in a log line
-  // whose whole purpose is to be read by whoever is debugging the deployment.
-  const secret = 'sk-this-must-never-appear-in-a-message'
+  // whose whole purpose is to be read by whoever is debugging the deployment — `fatalConfig` writes
+  // `err.message` verbatim to stderr and the collector ships it, so an echoed secret would move
+  // from one public place to another.
+  //
+  // It used to check that the message did not contain `sk-this-must-never-appear-in-a-message`, a
+  // string that was never passed to `loadEnv`. That assertion could not fail. What it checks now is
+  // that the message does not contain THE VALUE THAT WAS REJECTED, which is the property.
   for (const name of ['IDENTITY_KEY_SECRET', 'OUTBOX_SIGNING_SECRET']) {
-    try {
-      loadEnv({ ...COMPLETE, [name]: 'short' })
-      assert.fail(`${name} should have thrown`)
-    } catch (err) {
-      assert.ok(err instanceof EnvError)
-      assert.ok(!err.message.includes(secret))
-      assert.ok(err.message.includes(name))
+    for (const value of ['short', 'sk-this-must-never-appear-in-a-message', 'A'.repeat(64)]) {
+      try {
+        loadEnv({ ...COMPLETE, [name]: value })
+        assert.fail(`${name} should have thrown on ${value}`)
+      } catch (err) {
+        assert.ok(err instanceof EnvError, `${name} ${value}`)
+        assert.ok(!err.message.includes(value), `${name} echoed its value`)
+        assert.ok(err.message.includes(name), `${name} did not name itself`)
+      }
     }
   }
 })

@@ -28,6 +28,7 @@
 
 import {
   GOOD_PASSWORD,
+  TEST_KEY_SECRET_V1,
   enabled,
   freshEmail,
   freshHandle,
@@ -35,6 +36,7 @@ import {
   openDb,
   resetIdentity,
   skip,
+  testSecret,
 } from './testsupport.ts'
 import { randomUUID } from 'node:crypto'
 import { before, after, beforeEach, test } from 'node:test'
@@ -55,15 +57,23 @@ let sql: postgres.Sql
 let db: Db
 
 /*
- * Three distinct secrets, all long enough and none of them a placeholder.
+ * Three distinct secrets, all DERIVED rather than written down.
  *
- * `V1` is deliberately the same literal `testsupport.ts` puts in `IDENTITY_KEY_SECRET`, so a
- * keyring built here at v1 is byte-identical to the one the service builds from the environment.
- * That equality is what lets a blob written by the ordinary code path be drained by this test.
+ * `V1` is deliberately the SAME VALUE `testsupport.ts` puts in `IDENTITY_KEY_SECRET`, so a keyring
+ * built here at v1 is byte-identical to the one the service builds from the environment. That
+ * equality is what lets a blob written by the ordinary code path be drained by this test — and it
+ * is now imported rather than retyped, because the identity of two literals in two files is a
+ * property nothing checks until the day it stops holding.
+ *
+ * All three used to be hand-written, hyphenated strings — `test-key-secret-0123…`,
+ * `rotated-key-secret-fedcba…`, `a-completely-unrelated-secret-0000…`. Every one of them is now
+ * refused at boot by `@cloudsforge/secrets`, which is the point: they are the shape of the
+ * 40-character placeholder that reached 44 containers as micro-org #142, and a suite whose fixtures
+ * are that shape is a suite that teaches the shape.
  */
-const SECRET_V1 = 'test-key-secret-0123456789abcdef0123456789'
-const SECRET_V2 = 'rotated-key-secret-fedcba9876543210fedcba98'
-const SECRET_WRONG = 'a-completely-unrelated-secret-0000111122223333'
+const SECRET_V1 = TEST_KEY_SECRET_V1
+const SECRET_V2 = testSecret('IDENTITY_KEY_SECRET_V2')
+const SECRET_WRONG = testSecret('WRONG_KEY')
 
 const ringV1 = new Keyring(new Map([[1, SECRET_V1]]), 1)
 /** Mid-rotation: holds both, seals under the new one. This is the state the service runs in. */

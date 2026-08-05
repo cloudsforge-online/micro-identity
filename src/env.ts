@@ -19,6 +19,7 @@
 
 import { hostname } from 'node:os'
 import { SCOPE_NAMES, isScope, type Scope } from '@cloudsforge/contracts-auth'
+import { SecretError, assertGeneratedSecret } from '@cloudsforge/secrets'
 
 /**
  * The service's own name. A constant rather than a variable: it is a property of the repository,
@@ -35,42 +36,30 @@ export class EnvError extends Error {
   }
 }
 
-const PLACEHOLDERS = new Set([
-  'changeme',
-  'change-me',
-  'placeholder',
-  'secret',
-  'dev-secret',
-  'dev-outbox-signing-secret',
-  'replace-with-a-real-secret',
-  'xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx',
-])
-
 /**
- * Placeholder STEMS, refused wherever they BEGIN a value rather than only when they are the whole
- * of it.
+ * THE `PLACEHOLDERS` SET AND THE `PLACEHOLDER_STEMS` LIST THAT USED TO BE HERE ARE GONE, AND THEIR
+ * ABSENCE IS THE FIX.
  *
- * ── Why the exact-match set above was not enough ───────────────────────────────────────────────
+ * Between them they held thirteen strings and were paired with a 24-character floor (32 for the key
+ * secret). Neither could fail for the value that actually reached 44 containers on both networks:
+ * micro-org #142's `estate-only-outbox-secret-00000000000000` is 40 characters, does not begin with
+ * any stem, and was on nobody's list. A check that cannot fail is worse than no check, because the
+ * absence of an alarm gets read as the absence of a problem — and this service holds the key that
+ * wraps the RS256 private half every other service trusts.
  *
- * This repository's own `.env.example` shipped
- * `IDENTITY_KEY_SECRET=CHANGE_ME_at_least_32_characters_long`, and that value **booted**: it is 37
- * characters, so it cleared the length floor, and it is not any of the eight strings above, so it
- * cleared the placeholder check. A deployer who copies the example and edits everything except the
- * one line whose whole purpose is to be edited gets a running service whose forging key is a
- * literal in a public-shaped file — and `IDENTITY_KEY_SECRET` is, in `.env.example`'s own words,
- * "the estate's universal forging credential": whoever holds it can mint a token for any user and
- * any service, and every service in the estate accepts it.
+ * THE STEM LIST WAS ALREADY THE SECOND ATTEMPT, WHICH IS THE ARGUMENT AGAINST THE WHOLE APPROACH.
+ * The exact-match set shipped first; `.env.example`'s own `CHANGE_ME_at_least_32_characters_long`
+ * booted straight through it, so stems were added to catch a padded `CHANGE_ME`. The next
+ * placeholder somebody writes will not begin with a stem either. A deny-list is structurally unable
+ * to work, however many times it is extended, because the thing it must refuse is defined only by
+ * being something nobody has thought of yet.
  *
- * The refusal it slipped past IS the control. Matching the stem rather than the string is what
- * makes "CHANGE_ME" mean the same thing to this function as it does to the person reading the file,
- * however they padded it out to clear the length check.
- *
- * Compared against the value with separators and case removed, so `CHANGE_ME_…`, `change-me-…` and
- * `changeMe…` are one rule rather than three that can be added to one at a time.
+ * `@cloudsforge/secrets` asserts the SHAPE of a generated value instead — the property a
+ * placeholder cannot have — and it is imported rather than copied so that this service cannot drift
+ * from the other sixteen. Everything the stem list was reaching for is still refused, and by a rule
+ * that did not have to be told about it: `CHANGE_ME_at_least_32_characters_long` fails the alphabet
+ * check on its first underscore, and would fail the marker check even written in base64.
  */
-const PLACEHOLDER_STEMS = ['changeme', 'replaceme', 'replacewith', 'yoursecret', 'examplesecret']
-
-const withoutSeparators = (value: string): string => value.toLowerCase().replace(/[^a-z0-9]/g, '')
 
 type Source = Readonly<Record<string, string | undefined>>
 
@@ -80,18 +69,56 @@ function required(source: Source, name: string): string {
   return value
 }
 
-function requiredSecret(source: Source, name: string, minLength = 24): string {
+/**
+ * Re-wrap the shared guard's `SecretError` as this service's `EnvError`.
+ *
+ * `loadEnv` documents a single error class for every configuration failure, and the boot path
+ * catches that one class. The message is preserved verbatim — it already names the variable and the
+ * command that fixes it, and it never contains the value.
+ */
+function asEnvError<T>(run: () => T): T {
+  try {
+    return run()
+  } catch (err) {
+    if (err instanceof SecretError) throw new EnvError(err.message)
+    throw err
+  }
+}
+
+/**
+ * A secret THIS ESTATE GENERATES, held to the shape a generator produces and a keyboard does not.
+ *
+ * `assertGeneratedSecret` is the right class for every secret variable identity declares, and that
+ * was checked against the running containers rather than inferred from the names. The estate has
+ * `*_TOKEN` variables holding `cfsc_` credentials and `*_TOKEN` variables holding JWTs under the
+ * same suffix, so a name classifies nothing and pointing everything at the strict rule is how a
+ * service dies at boot on a correct value. Measured on 2026-08-05:
+ *
+ *     IDENTITY_KEY_SECRET_V2   base64, 48 characters
+ *     IDENTITY_KEY_SECRET_V3   base64, 48 characters   (hex/64 on the mainnet estate)
+ *     OUTBOX_SIGNING_SECRET    one alphabet, 64 characters, 32 bytes
+ *
+ * All of them are `openssl rand` output written into a gitignored file by an operator following a
+ * runbook, so the estate controls the alphabet and the strict rule is the correct one. Neither of
+ * the other two classes applies: identity MINTS `cfsc_` credentials rather than holding one, and
+ * nothing here arrives from a vendor whose alphabet somebody else chose.
+ *
+ * `IDENTITY_SERVICE_TOKEN_GRANTS` is deliberately NOT routed through here. It is not a secret at
+ * all — it is a JSON map of service name to scope array, and it is validated by
+ * `parseServiceGrants`, which asks the only question worth asking of it: are these scopes ones the
+ * contracts registry knows. Guarding it with a secret assertion would refuse `{}` at boot for
+ * failing an entropy floor, which is a category error with an outage attached.
+ *
+ * The old `minLength` parameter is gone rather than kept in front: it is a strict subset of the
+ * shape check, and running it first answers a 40-character placeholder with "must be at least 24
+ * characters" — true, useless, and about the wrong property. Its two different values (24 in
+ * general, 32 for the key secret) go with it. That distinction was an attempt to say "this one
+ * matters more"; it is expressed properly by both being held to 32 BYTES, which is more than either
+ * floor demanded and is the unit an AES key is actually measured in.
+ */
+function requiredGeneratedSecret(source: Source, name: string): string {
   const value = required(source, name)
-  const stripped = withoutSeparators(value)
-  if (PLACEHOLDERS.has(value.toLowerCase()) || PLACEHOLDER_STEMS.some((s) => stripped.startsWith(s))) {
-    // Names the variable, never the value. The message is read out of a deployment log.
-    throw new EnvError(`${name} is set to a known placeholder — generate a real secret`)
-  }
-  // Length is a proxy for entropy and the only one available here. It is set above the point at
-  // which a human-chosen string is plausible, so a memorable password fails this check too.
-  if (value.length < minLength) {
-    throw new EnvError(`${name} must be at least ${minLength} characters (got ${value.length})`)
-  }
+  asEnvError(() => assertGeneratedSecret(name, value))
   return value
 }
 
@@ -127,9 +154,15 @@ function parseKeySecrets(source: Source): { keySecrets: ReadonlyMap<number, stri
     if (!/^[0-9]{1,3}$/.test(suffix)) continue
     const version = Number(suffix)
     if (version < 1) throw new EnvError(`${name}: envelope versions start at 1`)
+    // EMPTY IS UNSET, AND THE CHECK STAYS AHEAD OF THE ASSERTION. Compose interpolates
+    // `${IDENTITY_KEY_SECRET_V3:-}` and an unset variable arrives as the empty string; a deployment
+    // part-way through a rotation on one network renders an empty `_V3` on the other. Asserting
+    // first would turn that render into `exit(1)` on the service every other service authenticates
+    // against. It is safe only because the write version must be present in the map — see below.
     if (!(source[name]?.trim())) continue
-    // 32 rather than the default 24: see the `keySecrets` field comment.
-    secrets.set(version, requiredSecret(source, name, 32))
+    // EVERY version present, not just the write version. A retained old secret still opens every
+    // blob that has not been re-sealed, so it is not a lesser secret for as long as it is there.
+    secrets.set(version, requiredGeneratedSecret(source, name))
   }
 
   const legacy = source[LEGACY_KEY_SECRET]?.trim()
@@ -142,7 +175,10 @@ function parseKeySecrets(source: Source): { keySecrets: ReadonlyMap<number, stri
         `${LEGACY_KEY_SECRET} and ${KEY_SECRET_PREFIX}1 are both set and differ — keep ${KEY_SECRET_PREFIX}1 and remove the unsuffixed one`,
       )
     }
-    if (explicit === undefined) secrets.set(1, requiredSecret(source, LEGACY_KEY_SECRET, 32))
+    // The unsuffixed name is held to exactly the rule `_V1` is. It is the same key material under
+    // an older name, and a compatibility branch that relaxed the guard would be the way every
+    // deployment kept the value the guard exists to refuse.
+    if (explicit === undefined) secrets.set(1, requiredGeneratedSecret(source, LEGACY_KEY_SECRET))
   }
 
   if (secrets.size === 0) {
@@ -259,9 +295,14 @@ export interface Env {
    * The key-encryption keys, BY VERSION — `IDENTITY_KEY_SECRET_V<n>`.
    *
    * Wraps the RS256 private half and every TOTP seed, AES-256-GCM under a scrypt-derived key (see
-   * keyEnvelope.ts). The longest secret this service takes, because it is the one whose disclosure
-   * is unbounded: it is not a password to something, it is the key to the key every service in the
-   * estate trusts.
+   * keyEnvelope.ts). It is the secret whose disclosure is unbounded: not a password to something,
+   * but the key to the key every service in the estate trusts.
+   *
+   * It used to carry a longer minimum than everything else — 32 characters against a general 24 —
+   * as the way of saying that. It no longer does, and that is not a relaxation: every secret this
+   * service reads is now held to 32 BYTES of key material, which is more than either floor asked
+   * for and is the unit an AES key is measured in. A rule that is stricter for one variable is a
+   * rule somebody has to remember; a rule that is right for all of them is not.
    *
    * A MAP rather than a string, and that is #188's fix. One value meant a rotation destroyed every
    * TOTP seed in the estate — unrecoverably, because the seed exists only in that blob and in the
@@ -368,8 +409,11 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     publicUrl: origin('IDENTITY_PUBLIC_URL', required(source, 'IDENTITY_PUBLIC_URL')),
     accountUrl: accountUrl.length > 0 ? origin('IDENTITY_ACCOUNT_URL', accountUrl) : null,
     handoffOrigins: Object.freeze([...new Set(handoffOrigins)]),
-    outboxSigningSecret: requiredSecret(source, 'OUTBOX_SIGNING_SECRET'),
+    outboxSigningSecret: requiredGeneratedSecret(source, 'OUTBOX_SIGNING_SECRET'),
     instanceId: optional(source, 'INSTANCE_ID', host || 'unknown'),
+    // NOT a secret, and deliberately not guarded as one — it is a map of service name to scope
+    // array, 60 characters of service names and scopes on the live estates. `parseServiceGrants`
+    // asks the question that matters of it: is every scope one the contracts registry knows.
     serviceTokenGrants: parseServiceGrants(optional(source, 'IDENTITY_SERVICE_TOKEN_GRANTS', '{}')),
     deletionGraceDays: integer(source, 'IDENTITY_DELETION_GRACE_DAYS', 7, 0, 365),
   }
