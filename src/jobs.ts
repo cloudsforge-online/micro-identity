@@ -23,7 +23,7 @@
 
 import { JobRunner, type JobQueue, type RunnerEvent } from '@cloudsforge/jobs'
 import type { Logger } from '@cloudsforge/telemetry'
-import { createRelay, type Db, type RelayDeps } from './outbox.ts'
+import { createRelay, redactExpiredSecrets, type Db, type RelayDeps } from './outbox.ts'
 import { dueForTombstone, tombstoneAccount } from './deletion.ts'
 
 export const RELAY_KIND = 'outbox.relay'
@@ -146,12 +146,30 @@ export function registerHandlers(runner: JobRunner, deps: JobDeps): JobRunner {
     const tokens = await deps.sql`
       delete from refresh_tokens where expires_at < now() - interval '90 days' returning id
     `
-    if (codes.length + challenges.length + resets.length + tokens.length > 0) {
+    if (ctx.signal.aborted) return
+    /*
+     * The copies that left the building — micro-org #184.
+     *
+     * The four sweeps above delete rows this service will never read again. This one edits rows it
+     * keeps: the outbox is never pruned, so a reset or verification link sits in a payload column
+     * for the life of the database unless something removes it. Deleting the row is not available —
+     * it is the audit record that the request happened — so the credential is stripped out of it
+     * and everything else is left standing.
+     *
+     * It runs here rather than on its own schedule because it is the same statement of intent as
+     * the deletes: a credential that has expired is a credential this deployment stops holding, and
+     * "at rest, in a payload we mailed out" is the one place that was not true.
+     */
+    const links = await redactExpiredSecrets(deps.sql)
+    if (codes.length + challenges.length + resets.length + tokens.length + links > 0) {
       deps.logger.info('expired credentials swept', {
         handoffCodes: codes.length,
         mfaChallenges: challenges.length,
         resetTokens: resets.length,
         refreshTokens: tokens.length,
+        // A count, never a row id and certainly never a payload. The whole point of the line above
+        // is that this value is the one thing that must not be written down anywhere.
+        redactedLinks: links,
       })
     }
   })

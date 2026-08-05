@@ -58,6 +58,7 @@ import {
 export const EMITTED_TOPICS = Object.freeze([
   'identity.user.registered',
   'identity.email.verification_requested',
+  'identity.password.reset_requested',
   'identity.user.deleted',
   'identity.session.created',
   'identity.session.revoked',
@@ -117,6 +118,49 @@ export const AWAITING_REGISTRATION: Readonly<Record<string, ProposedTopic>> = Ob
   // said "check your email" and no email could arrive. The quarantine did its job — it named the
   // exact paste and made the diagnosis one grep — but nothing here can stop a producer being
   // DEPLOYED ahead of its contract, because deployment order is not a property of a checkout.
+  /**
+   * The reset mail, and the sibling of `identity.email.verification_requested` in every respect
+   * that matters — same producer, same key, same consumer, same `secretParams` treatment at the
+   * far end. It is here rather than in the registry only because `micro-contracts` is a separate
+   * repository this agent does not write, which is the case this quarantine exists for.
+   *
+   * **Read this before deciding the payload should not carry `reset_url`.** #184 is open against
+   * the verification topic for carrying a live credential on the bus, and its remedy — emit a
+   * reference, let notify redeem the link at send time — is right there and wrong here. The reset
+   * token is stored ONLY as its SHA-256 (`passwordReset.ts`, `mintResetToken`), so identity cannot
+   * serve the link back later; reference-and-redeem for a reset means retaining the raw token in
+   * `password_reset_tokens`, which converts a thirty-minute exposure in an outbox row into a
+   * permanent one in the credential table. Two things bound this topic instead. The TTL is already
+   * 1/48th of the verification token's — #184's own second remedy, applied here from the day the
+   * table was written. And `redactExpiredSecrets` (outbox.ts) strips the link out of the row once
+   * the token behind it has expired, which answers the half of #184 the TTL does not: its finding
+   * is RETENTION, and "dead in thirty minutes" is an argument about exploitability rather than
+   * about what the database goes on holding.
+   *
+   * `linkable` is therefore always present and `reset_url` is not. A deployment with no
+   * `IDENTITY_ACCOUNT_URL` emits the event without a link, and so does a row the sweep has already
+   * been over; notify's rule refuses to send in both cases rather than mailing an empty button.
+   *
+   * `notify` carries the matching half of this proposal, character for character, so contracts
+   * adopting it is a paste from either side and the two repositories cannot propose two contracts
+   * for one topic.
+   */
+  'identity.password.reset_requested': {
+    reason:
+      "The only event that asks anybody to send a password reset. Until it existed `deliverPasswordReset` hard-returned `{ delivered: false, channel: 'none' }`, so `POST /auth/password/forgot` answered 202, recorded the token and sent nothing at all — a user who forgot their password depended on an operator noticing a warn line and issuing the link by hand. It is keyed and shaped as the sibling of identity.email.verification_requested so notify's rule for it is the same rule: it carries the address, so it is also the event from which a consumer can learn where to reach an account that predates verification.",
+    spec: {
+      producer: 'identity',
+      payloadType: 'PasswordResetRequested',
+      version: '1.0',
+      // The account whose credential is being replaced, matching every other identity topic:
+      // `activity` reads the owner straight off the key, ordering is per key, and two reset
+      // requests for one account must be ordered with respect to each other because the later one
+      // supersedes the earlier.
+      keyedBy: 'user_id',
+      description:
+        'A single-use password reset link has been minted for an account. Carries the address, and the link when one could be built — it expires in thirty minutes, works once, and is stripped back out of the outbox row once it has expired.',
+    },
+  },
   'identity.role.changed': {
     reason:
       "A platform role was granted or withdrawn — the single most consequential write in the estate, and until migration 12 the only one with no trail at all. SD-15's Identity row asks for it and admin-api's operator log is fed by the bus (admin-api/src/server.ts:510, the audit mirror), so a promotion that never reaches a topic is a promotion the estate audit of record cannot show. Every event carries the approval id, which is two operators' signatures out of admin-api's four-eyes queue; the bootstrap grant is the one promotion that predates any queue and is emitted by nothing, because it is written by a human against the database before this service is trusted to act.",

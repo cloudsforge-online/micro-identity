@@ -772,10 +772,13 @@ test('spending a reset sets the password and revokes every session', { skip }, a
   const { createPasswordResetToken, resetUrlFor } = await import('./passwordReset.ts')
   const issued = await createPasswordResetToken(db, registered.userId, null)
 
-  // SD-04: the link is built from IDENTITY_PUBLIC_URL and never from the request Host header, and
-  // the token rides in the fragment so it reaches no server log or Referer header.
-  const url = resetUrlFor(issued.token)
-  assert.ok(url.startsWith('https://account.test.cloudsforge.local/reset#token='))
+  // SD-04: the link is built from IDENTITY_ACCOUNT_URL — Hub's origin, where the page that spends
+  // the token actually lives — and never from the request Host header, and the token rides in the
+  // fragment so it reaches no server log or Referer header. It used to be built from
+  // IDENTITY_PUBLIC_URL, which on both estates is `http://identity:4000`: an internal compose
+  // address, over plain HTTP, routing no such path.
+  const url = resetUrlFor(issued.token)!
+  assert.ok(url.startsWith('https://hub.test.cloudsforge.local/account/reset#token='))
   assert.ok(!url.includes('127.0.0.1'), 'the link must never follow the request host')
 
   const reset = await call('POST', '/auth/password/reset', {

@@ -349,6 +349,72 @@ async function deliver(
   }
 }
 
+/* ------------------------------------------------------------------------ retention */
+
+/**
+ * Payload keys that carry a live credential, by topic — and the whole of this service's answer to
+ * micro-org #184.
+ *
+ * Both of these events put a single-use link in a payload, because the token is stored only as its
+ * SHA-256 and identity physically cannot serve one back later; reference-and-redeem would mean
+ * retaining the raw token in the credential table, which is strictly worse than the thing #184
+ * describes. The list is a constant rather than a flag on the emit site for the reason notify
+ * derives its own behaviour from `secretParams` rather than a second field: a value that must be
+ * scrubbed and a value that must not be replayed are the same value, and two opt-ins are two things
+ * to forget.
+ */
+const SECRET_PAYLOAD_KEYS: Readonly<Record<string, string>> = Object.freeze({
+  'identity.password.reset_requested': 'resetUrl',
+  'identity.email.verification_requested': 'verifyUrl',
+})
+
+/**
+ * Strip mailed credentials out of outbox rows whose token has already expired.
+ *
+ * ## What #184 actually says, and why the TTL argument is not a complete answer to it
+ *
+ * A live single-use credential travels on the bus and is **retained** in 160 outbox and 148 notify
+ * rows. The retention is the finding. Nothing prunes the outbox — `published_at` is stamped and the
+ * row stays for the life of the database — so every reset and every verification ever sent leaves a
+ * working link in a table for ever, recoverable by anything that reaches a replica, a backup, a
+ * `pg_dump` in a ticket, or an operator with read access and a reason to look.
+ *
+ * "It expires in thirty minutes" answers whether the retained copy is EXPLOITABLE. It does not
+ * answer whether it is retained, and the two are different promises: the first is a bet on nobody
+ * having read the row within the window, the second is a property of the data at rest. This makes
+ * the second true.
+ *
+ * ## Why keyed on the token's own expiry rather than on publication
+ *
+ * The condition is `expiresAt < now()` and nothing else — deliberately not `published_at is not
+ * null`. An undelivered row whose token has already expired cannot produce a usable mail no matter
+ * how many times the relay retries it, so the choice there is between a mail with no button and a
+ * credential kept for ever against the chance of sending a link that is already dead. `linkable` is
+ * corrected in the same statement so the replayed event is refused by notify's rule rather than
+ * rendered into a button with an empty href.
+ *
+ * Everything an auditor needs survives: that the request happened, for which account, when, on
+ * whose authority. The only thing removed is the part that could still take an account.
+ *
+ * Idempotent and cheap — `jsonb_exists` means a second pass over the same rows updates nothing —
+ * because the sweep it hangs off runs every fifteen minutes for the life of the deployment.
+ */
+export async function redactExpiredSecrets(sql: Db): Promise<number> {
+  let redacted = 0
+  for (const [topic, key] of Object.entries(SECRET_PAYLOAD_KEYS)) {
+    const rows = await sql<{ id: string }[]>`
+      update outbox
+         set payload = jsonb_set(payload - ${key}, '{linkable}', to_jsonb(false))
+       where topic = ${topic}
+         and jsonb_exists(payload, ${key})
+         and (payload ->> 'expiresAt')::timestamptz < now()
+      returning id
+    `
+    redacted += rows.length
+  }
+  return redacted
+}
+
 /* ------------------------------------------------------------------------ inbox */
 
 export type InboxOutcome<T> = { readonly status: 'processed'; readonly value: T } | { readonly status: 'duplicate' }

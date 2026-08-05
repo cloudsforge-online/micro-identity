@@ -78,10 +78,8 @@ import {
 } from './organisations.ts'
 import {
   RESET_REQUEST_STATUS,
-  createPasswordResetToken,
   deliverPasswordReset,
   redeemPasswordResetToken,
-  resetUrlFor,
   revokePasswordResetTokens,
 } from './passwordReset.ts'
 import {
@@ -1277,15 +1275,12 @@ function buildRoutes(): Route[] {
         status: 202,
         body: { status: RESET_REQUEST_STATUS },
         after: async () => {
-          try {
-            const { token } = await createPasswordResetToken(deps.sql, user.id, null)
-            // The URL is built and handed straight to delivery. It is the only copy of the token in
-            // existence and it is not logged, not persisted, and not put in an error message.
-            void resetUrlFor(token)
-            await deliverPasswordReset(ctx.log, { userId: user.id })
-          } catch (err) {
-            ctx.log.error('password reset preparation threw', { err, userId: user.id })
-          }
+          // One call, and it cannot throw: `deliverPasswordReset` mints the token and emits
+          // `identity.password.reset_requested` in a single transaction and reports failure by
+          // return value. The `catch` that used to be here logged `{ err }`, and that became a
+          // credential leak the moment the reset URL started travelling as a query parameter —
+          // postgres.js attaches `parameters` to its errors. See passwordReset.ts, rule 2.
+          await deliverPasswordReset(deps.sql, ctx.log, user, null, ctx.requestId)
         },
       }
     }),
