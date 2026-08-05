@@ -105,20 +105,18 @@ export const AWAITING_REGISTRATION: Readonly<Record<string, ProposedTopic>> = Ob
   // rather than as an exemption. The spec below is the entry to paste into
   // `contracts/packages/events/src/index.ts`; the moment it lands there, `adoptedProposals()` turns
   // non-empty and this suite fails until the entry is deleted from here.
-  'identity.email.verification_requested': {
-    reason:
-      "A new account needs to prove control of its address, and this is the only way the fact leaves identity: the service does not speak SMTP (passwordReset.ts:173-179 rejects a second mail transport by name), so `notify` renders and sends the link. Until this topic existed, registration minted a session on the spot and `users.email_verified_at` — a column present since migration 3 and published by toPublicUser — was written by nothing at all, so an address nobody had proved control of could sign in for ever. The payload carries the absolute link, which puts a single-use 24-hour credential in notify's database: the same trade every notification's template parameters already make, and the reason the token is single-use and short-lived.",
-    spec: {
-      producer: 'identity',
-      payloadType: 'EmailVerificationRequested',
-      version: '1.0',
-      // The account, not the token. `activity` reads the owner straight off the key for identity
-      // topics, and ordering is per key — a resend must be ordered after the mint it supersedes.
-      keyedBy: 'user_id',
-      description:
-        'An account asked for its email address to be verified, carrying the single-use link to send.',
-    },
-  },
+  // `identity.email.verification_requested` was the third entry to leave this table the way the
+  // doc above promises, and the first whose absence had already reached users. contracts has
+  // adopted it — the spec there is character for character the one that used to sit here — so
+  // `adoptedProposals()` turned non-empty and this suite failed until the entry was deleted.
+  //
+  // It is worth recording WHEN it was adopted, because the order was wrong and the order is what
+  // hurt: this service shipped to production as 1.1.0 while the registry was still behind. For
+  // that window `notify` answered every verification event with 400 ("not in this registry"), no
+  // mail was rendered, and `signInRefusal` then refused the account it belonged to. Registration
+  // said "check your email" and no email could arrive. The quarantine did its job — it named the
+  // exact paste and made the diagnosis one grep — but nothing here can stop a producer being
+  // DEPLOYED ahead of its contract, because deployment order is not a property of a checkout.
   'identity.role.changed': {
     reason:
       "A platform role was granted or withdrawn — the single most consequential write in the estate, and until migration 12 the only one with no trail at all. SD-15's Identity row asks for it and admin-api's operator log is fed by the bus (admin-api/src/server.ts:510, the audit mirror), so a promotion that never reaches a topic is a promotion the estate audit of record cannot show. Every event carries the approval id, which is two operators' signatures out of admin-api's four-eyes queue; the bootstrap grant is the one promotion that predates any queue and is emitted by nothing, because it is written by a human against the database before this service is trusted to act.",
