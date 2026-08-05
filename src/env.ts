@@ -210,6 +210,25 @@ export interface Env {
    */
   readonly publicUrl: string
   /**
+   * Where the account pages live — Hub's origin, NOT this service's.
+   *
+   * `publicUrl` above is identity's own address, which is right for identity's own routes and wrong
+   * for this one: the email-verification link points at a PAGE (`/account/verify`) that Hub serves,
+   * and that page posts the token back here. Building it from `publicUrl` would mail every new user
+   * a link to a path this service does not route.
+   *
+   * **Optional, and it stays optional.** A deployment that has not configured Hub's origin must
+   * still be able to register people: the token is minted, the event is emitted, and the payload
+   * carries `linkable: false` instead of a URL. Making it required would turn a missing line in a
+   * deploy manifest into "nobody can create an account", which is a worse failure than "the mail
+   * that goes out has no button in it" — and rule 9's point is that the manifest is derived from
+   * this file, so a new required variable breaks every existing environment at once.
+   *
+   * Never the request `Host` header, for the reason `publicUrl` records above; the argument is if
+   * anything stronger here, because this link is what proves control of the mailbox.
+   */
+  readonly accountUrl: string | null
+  /**
    * Origins an SSO hand-off code may be redeemed from and redirected to.
    *
    * The allowlist is the whole security of the hand-off: a code is bound to one origin at mint and
@@ -250,6 +269,12 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     .filter((value) => value.length > 0)
     .map((value) => origin('IDENTITY_HANDOFF_ORIGINS', value))
 
+  // Optional, so it is read through `optional` and validated only when there is something to
+  // validate — the same two-step the hand-off allowlist above uses. `origin()` on an empty string
+  // would refuse to boot every deployment that has not set it, which is precisely what this
+  // variable must not do.
+  const accountUrl = optional(source, 'IDENTITY_ACCOUNT_URL', '')
+
   return {
     port: integer(source, 'PORT', 4000, 1, 65_535),
     env: optional(source, 'NODE_ENV', 'development'),
@@ -263,6 +288,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     // 32 rather than the default 24: see the field comment.
     keySecret: requiredSecret(source, 'IDENTITY_KEY_SECRET', 32),
     publicUrl: origin('IDENTITY_PUBLIC_URL', required(source, 'IDENTITY_PUBLIC_URL')),
+    accountUrl: accountUrl.length > 0 ? origin('IDENTITY_ACCOUNT_URL', accountUrl) : null,
     handoffOrigins: Object.freeze([...new Set(handoffOrigins)]),
     outboxSigningSecret: requiredSecret(source, 'OUTBOX_SIGNING_SECRET'),
     instanceId: optional(source, 'INSTANCE_ID', host || 'unknown'),

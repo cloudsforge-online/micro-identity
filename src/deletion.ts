@@ -210,6 +210,11 @@ export async function tombstoneAccount(sql: Db, userId: string): Promise<boolean
     await tx`delete from mfa_factors where user_id = ${userId}`
     await tx`delete from mfa_challenges where user_id = ${userId}`
     await tx`delete from password_reset_tokens where user_id = ${userId}`
+    // Consumed rows as well as live ones. A spent verification row records that this address
+    // existed and when its owner proved it, keyed to a user whose status says they are gone — and
+    // `on delete cascade` does nothing here for the reason the comment above gives: a tombstone is
+    // an UPDATE and fires no cascade.
+    await tx`delete from email_verification_tokens where user_id = ${userId}`
     await tx`delete from auth_exchange_codes where user_id = ${userId}`
     // Keyed on the address rather than the id, so it would otherwise outlive the address itself.
     await tx`delete from login_attempts where email = ${previousEmail}`

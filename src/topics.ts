@@ -57,6 +57,7 @@ import {
  */
 export const EMITTED_TOPICS = Object.freeze([
   'identity.user.registered',
+  'identity.email.verification_requested',
   'identity.user.deleted',
   'identity.session.created',
   'identity.session.revoked',
@@ -99,6 +100,25 @@ export const AWAITING_REGISTRATION: Readonly<Record<string, ProposedTopic>> = Ob
   // for each, and the test that asserts every entry is GENUINELY absent from the registry failed
   // until they were deleted. That is the third property in the doc above doing exactly what it
   // promised: the quarantine empties itself rather than rotting into a permanent allow-list.
+  // `micro-contracts` is a separate repository and is not this agent's to write, which is the case
+  // this quarantine exists for — the mechanism the file header describes, used exactly as intended
+  // rather than as an exemption. The spec below is the entry to paste into
+  // `contracts/packages/events/src/index.ts`; the moment it lands there, `adoptedProposals()` turns
+  // non-empty and this suite fails until the entry is deleted from here.
+  'identity.email.verification_requested': {
+    reason:
+      "A new account needs to prove control of its address, and this is the only way the fact leaves identity: the service does not speak SMTP (passwordReset.ts:173-179 rejects a second mail transport by name), so `notify` renders and sends the link. Until this topic existed, registration minted a session on the spot and `users.email_verified_at` — a column present since migration 3 and published by toPublicUser — was written by nothing at all, so an address nobody had proved control of could sign in for ever. The payload carries the absolute link, which puts a single-use 24-hour credential in notify's database: the same trade every notification's template parameters already make, and the reason the token is single-use and short-lived.",
+    spec: {
+      producer: 'identity',
+      payloadType: 'EmailVerificationRequested',
+      version: '1.0',
+      // The account, not the token. `activity` reads the owner straight off the key for identity
+      // topics, and ordering is per key — a resend must be ordered after the mint it supersedes.
+      keyedBy: 'user_id',
+      description:
+        'An account asked for its email address to be verified, carrying the single-use link to send.',
+    },
+  },
   'identity.role.changed': {
     reason:
       "A platform role was granted or withdrawn — the single most consequential write in the estate, and until migration 12 the only one with no trail at all. SD-15's Identity row asks for it and admin-api's operator log is fed by the bus (admin-api/src/server.ts:510, the audit mirror), so a promotion that never reaches a topic is a promotion the estate audit of record cannot show. Every event carries the approval id, which is two operators' signatures out of admin-api's four-eyes queue; the bootstrap grant is the one promotion that predates any queue and is emitted by nothing, because it is written by a human against the database before this service is trusted to act.",

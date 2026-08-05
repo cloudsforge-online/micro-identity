@@ -103,6 +103,28 @@ test('the public URL must be an origin, because a reset link is built from it', 
   assert.equal(loadEnv({ ...COMPLETE, IDENTITY_PUBLIC_URL: 'https://a.example/' }).publicUrl, 'https://a.example')
 })
 
+test('the account URL is OPTIONAL, and an estate that has not set it still registers people', () => {
+  // It is absent from COMPLETE on purpose: `every required variable names itself when it is
+  // missing` above iterates COMPLETE, so a variable that belongs there is one whose absence is a
+  // boot failure. This one's absence must not be. Minting a verification token has to keep working
+  // in a deployment that has not configured Hub's origin yet — what stops is only the ability to
+  // BUILD the link, which the delivery seam reports (emailVerification.ts) rather than throwing on
+  // the one route where a throw would mean registration itself starts failing.
+  assert.equal(loadEnv(COMPLETE).accountUrl, null)
+  assert.equal(loadEnv({ ...COMPLETE, IDENTITY_ACCOUNT_URL: '   ' }).accountUrl, null)
+})
+
+test('the account URL must be an origin, because the verification link is built from it', () => {
+  // The same rule IDENTITY_PUBLIC_URL is held to, and for a sharper reason: this one is not
+  // identity's own origin. The link points at a page Hub serves, and the token rides in the
+  // FRAGMENT — so a configured value carrying a path, a query or a fragment of its own would
+  // produce a URL whose '#' is not where the code thinks it is.
+  for (const bad of ['not-a-url', 'ftp://hub.example', 'https://hub.example/account', 'https://hub.example#x']) {
+    assert.throws(() => loadEnv({ ...COMPLETE, IDENTITY_ACCOUNT_URL: bad }), EnvError, bad)
+  }
+  assert.equal(loadEnv({ ...COMPLETE, IDENTITY_ACCOUNT_URL: 'https://hub.example/' }).accountUrl, 'https://hub.example')
+})
+
 test('hand-off origins are parsed, normalised and de-duplicated', () => {
   const env = loadEnv({
     ...COMPLETE,

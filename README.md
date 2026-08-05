@@ -81,8 +81,10 @@ is a conditional `UPDATE … RETURNING`, hand-off redemption is single-use by ro
 | `GET` | `/readyz` | **no auth** | 200 ready / 503 not (`src/server.ts:620`) |
 | `GET` | `/metrics` | **no auth** | Prometheus text (`src/server.ts:625`) — see Known gaps |
 | `GET` | `/.well-known/jwks.json` | **no auth** | public keys. **The one route in the file that is not `no-store`**: `public, max-age=300`, because a verifier re-fetching per request would make identity a synchronous dependency of every request in twenty-two services, which SD-01 rejects on availability grounds (`src/server.ts:647`, reasoning at `:639-646`) |
-| `POST` | `/auth/register` | **no auth** | creates the user, a `profiles` row and a **personal organisation** in one transaction, then completes a session immediately with `amr: ['pwd']` (`src/server.ts:655`) |
-| `POST` | `/auth/login` | **no auth** | password sign-in; one message for every validation failure so nothing varies with whether the account exists (`src/server.ts:691`, reasoning at `:694-697`) |
+| `POST` | `/auth/register` | **no auth** | creates the user, a `profiles` row and a **personal organisation** in one transaction, mints a verification token and answers **202 — no session, no tokens** (`src/server.ts:790`). It used to complete a session on the spot, which is how an address nobody had proved control of signed in: `{ verificationRequired: true, email, status }` is what it answers now |
+| `POST` | `/auth/email/verify` | **no auth** (holds a token) | spends the verification link, stamps `users.email_verified_at` and mints the account's **first** session, `amr: ['pwd']` (`src/server.ts:847`). **POST, and there is deliberately no GET that consumes a token**: the link in the mail is a page on Hub with the token in the URL *fragment*, so a mail scanner's pre-fetch is `GET /account/verify` carrying nothing (`src/emailVerification.ts:15-36`) |
+| `POST` | `/auth/email/verify/resend` | **no auth** | always **202**, with one fixed string for an account that needs a link, one that does not, one that does not exist and a malformed identifier alike — and the work happens in an `after` hook, because the timing is the oracle (`src/server.ts:918`) |
+| `POST` | `/auth/login` | **no auth** | password sign-in; one message for every validation failure so nothing varies with whether the account exists (`src/server.ts:959`, reasoning at `:694-697`). An unverified account is refused **after** the password verifies, `403 email_unverified` — its own code, because the client can act on it by offering a resend (`src/server.ts:298`, `:539`) |
 | `POST` | `/auth/mfa` | **no auth** (holds a challenge) | completes a sign-in that stopped at a second factor (`src/server.ts:785`) |
 | `POST` | `/auth/refresh` | **no auth** (holds a refresh token) | rotates the refresh token; reuse burns the family (`src/server.ts:844`) |
 | `POST` | `/auth/logout` | **no auth** (holds a refresh token) | 204; ends the session and its family (`src/server.ts:885`) |
@@ -115,13 +117,15 @@ is a conditional `UPDATE … RETURNING`, hand-off redemption is single-use by ro
 | `POST` | `/admin/signing-keys/:kid/activate` | **admin** | starts it signing; refuses a key published for less than 20 minutes (`src/server.ts:1361`) |
 | `POST` | `/admin/signing-keys/:kid/retire` | **admin** | removes it from the JWKS (`src/server.ts:1387`) |
 
-### The twelve routes that make no `authenticate()` call
+### The fourteen routes that make no `authenticate()` call
 
 `/livez`, `/readyz`, `/metrics`, `/.well-known/jwks.json`, `/auth/register`, `/auth/login`,
-`/auth/mfa`, `/auth/refresh`, `/auth/logout`, `/auth/password/forgot`, `/auth/password/reset`,
-`/auth/handoff/redeem`. Each of the last eight carries its own bearer credential in the body — a
-refresh token, an MFA challenge, a reset token, a hand-off code — which is why an `Authorization`
-header on them is ignored rather than refused. Note that `POST /auth/handoff` (mint) **does**
+`/auth/email/verify`, `/auth/email/verify/resend`, `/auth/mfa`, `/auth/refresh`, `/auth/logout`,
+`/auth/password/forgot`, `/auth/password/reset`, `/auth/handoff/redeem`. Each of the last ten
+carries its own bearer credential in the body — a refresh token, an MFA challenge, a reset token, a
+verification token, a hand-off code — which is why an `Authorization` header on them is ignored
+rather than refused. (`/auth/email/verify/resend` carries none: it takes an identifier and answers
+the same 202 whatever it is given.) Note that `POST /auth/handoff` (mint) **does**
 authenticate; only `/redeem` does not.
 
 **A verifier that could not reach this service's own database answers 503, never 401**
@@ -235,7 +239,7 @@ A dead-lettered recurring job is deliberately **not** re-armed (`src/jobs.ts:65-
 
 ## The database
 
-Migrations 1–12 in `src/migrations.ts`, run only by `src/migrator.ts`. `index.ts` asserts the version
+Migrations 1–13 in `src/migrations.ts`, run only by `src/migrator.ts`. `index.ts` asserts the version
 and refuses to serve below it. `BASELINE_VERSION = 0`: identity is built fresh rather than migrated
 in place, because Nimbus's database keeps serving Nimbus until the cutover.
 
@@ -250,6 +254,8 @@ in place, because Nimbus's database keeps serving Nimbus until the cutover.
 | `platform_role_grants_one_bootstrap`, a **partial** unique index `where source = 'bootstrap'` (migration **12**) | a second bootstrap grant, ever, from any client including psql | **the estate gets exactly one administrator that answers to nothing.** Partial and not a plain unique on `source`, because capping *approved* grants at one would make a second administrator impossible and four-eyes approval needs two operators (`src/migrations.ts`, migration 12) |
 | `users_roles_need_a_grant`, a **deferred constraint trigger** on `users` (migration **12**) | a row that gains a privileged role with no grant row written in the same transaction | a CHECK cannot reference another table and cannot see the old row. Deferred so the grant and the promotion may be written in either order, which also means a bare `update users set roles = array['admin']` from psql fails at `COMMIT` rather than being caught by a handler the attacker is already past |
 | `platform_role_grants_immutable`, a before-`UPDATE`-or-`DELETE` trigger (migration **12**) | any edit or deletion of a grant row | without it the one-shot index above is re-armable by one `DELETE`, and a promotion is un-recordable after the fact |
+| `email_verification_tokens_one_live`, a **partial** unique index on `(user_id) where consumed_at is null` (migration **13**) | a second live verification token for one account | two live links means the older one — the one most likely to have leaked into a mail client, a chat log or a scanner's cache — still verifies. `emailVerification.ts` supersedes under `pg_advisory_xact_lock` so the race cannot happen; **this index is what makes the state unrepresentable if a future edit drops the lock**. Partial, because a plain unique on `user_id` would make an account verifiable exactly once for the life of the database and every resend would fail at 23505 (`src/migrations.ts:769`, reasoning at `:757-768`) |
+| migration 13's backfill — `email_verified_at = created_at` for every existing row | locking out the whole platform on deploy | every account that exists when it runs was created by a service with no verification at all, so none was ever offered a link. Refusing them instead would sign out every user *and the bootstrap administrator*, in an estate where nothing yet consumes `identity.email.verification_requested` — so there would be no way back in. `created_at` and not `now()`: the claim is "this account predates verification" (`src/migrations.ts:777-779`) |
 | `signing_keys.private_jwk_enc` **not null** | a plaintext private key | unlike Nimbus, this schema has never had a plaintext column to fall back to (`src/migrations.ts:163-164`) |
 | `devices_user_fingerprint_uniq` | a duplicate device row per user | the stored value is a hash, never the raw fingerprint: the raw value is a tracking identifier with no use the hash does not serve (`src/migrations.ts:208`, `:200-201`) |
 | `memberships` PK `(organisation_id, user_id)` + `memberships_role_chk` | a duplicate or unnamed role | — |
@@ -303,6 +309,7 @@ slice had to reconstruct the list by reading `src/env.ts`, guessing one value wr
 | `IDENTITY_ISSUER` | — | **required**. The `iss` claim minted and verified. A mismatch presents as a **universal 401 a long way from its cause**, which is why `bad_issuer` is reported separately from a bad signature (`src/env.ts:234`, `:163-167`) |
 | `IDENTITY_KEY_SECRET` | — | **required, ≥32 chars, placeholders refused.** Wrong → no key can be unwrapped and nothing can be signed. Disclosed → the estate is forgeable (`src/env.ts:236`). A placeholder is matched by **stem, not by exact string**: this file's own `.env.example` shipped `CHANGE_ME_at_least_32_characters_long`, which cleared both the length floor and the exact-match set and **booted** — a committed forging key one un-edited line away from production (`src/env.ts:49-73`) |
 | `IDENTITY_PUBLIC_URL` | — | **required**, an origin with no path/query/fragment. Where reset links point, and **never the request `Host` header** (SD-04): Nimbus learned this the hard way — while nothing delivered mail it was latent, and wiring SMTP turned it into unauthenticated account takeover, a forged `Host` having the deployment's own relay mail the victim a genuine reset link pointing at the attacker's origin (`src/env.ts:237`, `:176-182`) |
+| `IDENTITY_ACCOUNT_URL` | `` (none) | **optional**, an origin with no path/query/fragment. Where an email-verification link points — **Hub's origin, not this service's**: the link opens `<origin>/account/verify#token=…`, a page Hub serves, which posts the token back to `POST /auth/email/verify`. Unset is a supported mode and deliberately so: the token is still minted and the event still emitted, carrying `linkable: false` instead of a `verifyUrl`, because making it required would turn a missing line in a deploy manifest into "nobody can create an account". What it costs while unset is the button in the mail (`src/env.ts:230`, `:291`; the seam reports it at `src/emailVerification.ts:311`) |
 | `IDENTITY_HANDOFF_ORIGINS` | `` (none) | comma-separated origins allowed to receive a hand-off. **Empty means none**, which is the safe default rather than the convenient one — an empty list makes SSO fail closed, and "empty means allow everything" is how an allowlist becomes an open redirect. **This is the only open-redirect guard in the estate's SSO**: `?return=` is a query parameter on a public page, and `hub-web` deliberately keeps no second list of its own. Every deployment must set it or a user can sign in at Hub and reach no other surface — `.env.example` carries the local `pnpm dev` set and says what goes wrong in both directions. Normalised through `origin()` so a trailing slash on one side is not a mismatch that reads to the user as "sign in bounced me" (`src/env.ts:219-223`, `:85-91`; refusal proved by `an EMPTY allowlist mints nothing at all`, `src/tokens.test.ts`) |
 | `OUTBOX_SIGNING_SECRET` | — | **required, ≥24 chars.** Wrong → subscribers cannot verify an event came from us (`src/env.ts:239`) |
 | `INSTANCE_ID` | hostname | names this replica in `jobs.locked_by` (`src/env.ts:240`) |
@@ -393,8 +400,14 @@ transactional rotation, and none of them can be proved against a fake. CI is the
   split — `wallet`, `market`, `mint` and `worlds` serve `/v1/…`, `identity`, `ledger`, `foresight`,
   `pricing` and `activity` do not — and the public API is specified as URL-versioned with no gateway
   rewrite defined (`docs/ecosystem/18-build-status.md` §3.3d, item 3).
-* **No email verification flow.** `users.email_verified_at` exists (`src/migrations.ts:107`) and no
-  route sets it.
+* **Nothing sends the verification email yet.** The flow exists end to end inside this service —
+  the token, the routes, the refusal at sign-in — and the fact leaves as
+  `identity.email.verification_requested` (`src/emailVerification.ts:167`) because identity does not
+  speak SMTP and `notify` owns every outbound channel. Until `notify` subscribes to that topic, a
+  new account is created, refused at sign-in and has no way to receive its link. **A deployment must
+  set `IDENTITY_ACCOUNT_URL` before it turns this on**, or the event carries `linkable: false` and
+  there is no URL to render. The same gap the password-reset bullet above describes, on the same
+  blocker.
 * **§3.3g's stated reason is wrong** (the conclusion is not). Recorded above; reported rather than
   edited, because this task's remit is this repository's README.
 

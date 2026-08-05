@@ -32,6 +32,7 @@ import {
   isServiceClaims,
   isUserClaims,
   normaliseEmail,
+  normaliseHandle,
   validateLogin,
   validateRegistration,
   type AuthMethod,
@@ -83,6 +84,13 @@ import {
   resetUrlFor,
   revokePasswordResetTokens,
 } from './passwordReset.ts'
+import {
+  VERIFICATION_REQUIRED_STATUS,
+  VERIFICATION_RESEND_STATUS,
+  redeemEmailVerification,
+  reportVerificationDelivery,
+  requestEmailVerification,
+} from './emailVerification.ts'
 import { createHandoffCode, redeemHandoffCode } from './handoff.ts'
 import {
   ScopeNotGrantedError,
@@ -280,6 +288,21 @@ class NotFoundError extends Error {
   }
 }
 
+/**
+ * The password was right and the address has never been proved.
+ *
+ * A distinct class rather than a `ForbiddenError`, for the same reason `LastOwnerError` is one: the
+ * client can ACT on this. `forbidden` tells a sign-in form to give up; `email_unverified` tells it
+ * to offer "send it again", which is the only useful thing on the screen at that moment. A code
+ * a client cannot branch on would leave the user staring at a refusal with no way out of it.
+ */
+class EmailUnverifiedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'EmailUnverifiedError'
+  }
+}
+
 /** This service could not decide. 503, never 401. */
 class UnavailableError extends Error {
   constructor(message: string) {
@@ -426,6 +449,13 @@ const LIMITS: Readonly<Record<string, number>> = {
   '/auth/password': 10,
   '/auth/password/forgot': 5,
   '/auth/password/reset': 10,
+  // The two halves of one journey, and the numbers say which half is guessable. Redeeming presents
+  // a 256-bit token, so 10 matches `/auth/password/reset` — the other route that spends a mailed
+  // credential. Asking for another link is the credential-free half and carries the 5 that
+  // `/auth/password/forgot` and `/auth/register` carry: it costs an email, and an uncapped one is a
+  // way to make the estate mail a third party repeatedly.
+  '/auth/email/verify': 10,
+  '/auth/email/verify/resend': 5,
   // Mint and redeem are the two halves of ONE cross-surface navigation, exactly 1:1 — every code
   // this route issues is a code `/auth/handoff/redeem` spends — so the pair carries one number.
   // Below 20 would cap the journey at less than its own second half; above 20 would let a stolen
@@ -503,6 +533,11 @@ async function handle(
           },
         },
       }
+    }
+    if (err instanceof EmailUnverifiedError) {
+      // 403 and not 401: the caller authenticated perfectly well and is being refused something.
+      // The code is what hub-web branches on to offer a resend.
+      return errorReply(403, 'email_unverified', err.message, ctx.requestId)
     }
     if (err instanceof ReauthenticationRequiredError) {
       return errorReply(403, 'reauthentication_required', err.message, ctx.requestId)
@@ -761,39 +796,174 @@ function buildRoutes(): Route[] {
 
       const done = deps.lifecycle.track()
       try {
-        // The request id is threaded through so the registration, session and device events a
-        // sign-up produces share one correlation id. The `identity.user.registered` event is
-        // emitted inside `registerUser`, in the same transaction as the account — the audit line
-        // below is a log and has never been a substitute for it.
-        const { user, organisation } = await registerUser(
-          deps.sql,
-          validated.value,
-          ctx.requestId,
-        )
-        // A fresh account has no factors, so registration completes a session immediately. `amr` is
-        // `pwd` and nothing more, which is what lets a later step-up policy tell this session apart
-        // from one that presented a second factor.
-        const session = await startSession(deps.sql, {
-          userId: user.id,
-          client: clientContext(ctx.req),
-          amr: ['pwd'],
-          correlationId: ctx.requestId,
-        })
-        const { accessToken, expiresIn } = await issueFor(deps.sql, user, session.sessionId, ['pwd'])
-        deps.metrics.increment('identity_logins_total', { amr: 'pwd' })
+        // The request id is threaded through so the two events a sign-up now produces —
+        // `identity.user.registered` and `identity.email.verification_requested` — share one
+        // correlation id. The first is emitted inside `registerUser`, in the same transaction as
+        // the account; the audit line below is a log and has never been a substitute for it.
+        const { user } = await registerUser(deps.sql, validated.value, ctx.requestId)
+
+        /*
+         * NO SESSION. THIS IS THE POINT OF THE ROUTE'S 202.
+         *
+         * This used to mint one here — `startSession` then `issueFor`, 201 with an access token and
+         * a refresh token — which is how an address nobody had proved control of got signed in the
+         * moment it was typed. The owner reported both halves from the live product: "i didn't
+         * receive any registration email and i was able to login directly."
+         *
+         * The account exists and is unverified. `signInRefusal` (users.ts) refuses it until the
+         * link is spent, and `POST /auth/email/verify` is what mints the first session.
+         */
+        const issued = await requestEmailVerification(deps.sql, user, ctx.requestId)
+        reportVerificationDelivery(ctx.log, { userId: user.id, linkable: issued.linkable })
         ctx.log.info('registered', { audit: 'user_registered', userId: user.id })
         return {
-          status: 201,
+          status: 202,
           body: {
-            accessToken,
-            refreshToken: session.refreshToken,
-            expiresIn,
-            user: toPublicUser(user),
-            organisation,
+            verificationRequired: true,
+            // The normalised address, which is what the mail went to — a user who typed
+            // `Sam@Example.com` must be shown the spelling the platform will use, or "check your
+            // email" points at an inbox they will not think to look in.
+            email: user.email,
+            status: VERIFICATION_REQUIRED_STATUS,
           },
         }
       } finally {
         done()
+      }
+    }),
+
+    /**
+     * Spend a verification link: prove the address, and sign the user in.
+     *
+     * **POST, with the token in the BODY, and there is deliberately no GET that consumes one.** The
+     * link in the email is a page — `<IDENTITY_ACCOUNT_URL>/account/verify#token=…` — and the token
+     * rides in the fragment, which a browser never transmits. A mail scanner that pre-fetches the
+     * link therefore issues `GET /account/verify` with nothing after it, loads a static shell and
+     * consumes nothing; the page reads `location.hash` and posts here. See emailVerification.ts.
+     *
+     * The session it creates is an ORDINARY one — the same `startSession` + `issueFor` registration
+     * used to do — because a second credential kind would be a second thing to revoke, to refresh
+     * and to reason about, and there is nothing about this session that differs after it exists.
+     */
+    define('POST', '/auth/email/verify', async (ctx, deps) => {
+      const body = await readJson(ctx.req)
+      const token = requireString(body, 'token')
+
+      const done = deps.lifecycle.track()
+      try {
+        // The redemption commits before this returns, so the row read below already carries the
+        // stamp — there is no second lookup here for that reason.
+        const userId = await redeemEmailVerification(deps.sql, token)
+        if (!userId) {
+          // Expired, already spent, or never real. All three read the same way to the person
+          // holding the link, and separating them would say whether a guessed token had ever
+          // existed. The token itself is not in this line, or in any other.
+          ctx.log.warn('email verification token rejected')
+          throw new UnauthenticatedError('that verification link is invalid or has expired')
+        }
+        const user = await findUserById(deps.sql, userId)
+        if (!user) throw new UnauthenticatedError('that verification link is invalid or has expired')
+        // The address is proved; the account can still be suspended, locked or deleted, and this is
+        // the same gate the sign-in path applies. Without it a suspended user holds a link that
+        // mints a session the sign-in route would refuse them.
+        const refusal = signInRefusal(user)
+        if (refusal) throw new ForbiddenError(`this account is ${refusal}`)
+
+        const session = await startSession(deps.sql, {
+          userId: user.id,
+          client: clientContext(ctx.req),
+          // `pwd`, and this is the honest value THE TYPE ADMITS rather than the honest value full
+          // stop. `AuthMethod` is `'pwd' | 'totp' | 'webauthn' | 'recovery_code' | 'sso'`
+          // (contracts-auth/src/index.ts:707) and what actually happened here is "proved control of
+          // the mailbox" — a value that union does not carry. Widening a contract every service in
+          // the estate verifies against, from inside one service, to record a nuance no policy
+          // reads yet, is not a trade worth making. `pwd` is also true: the password was set
+          // minutes ago at registration, and spending this link proves the same person holds the
+          // address it was set for.
+          amr: ['pwd'],
+          correlationId: ctx.requestId,
+        })
+        await touchLastSeen(deps.sql, user.id)
+        const { accessToken, expiresIn } = await issueFor(deps.sql, user, session.sessionId, ['pwd'])
+        deps.metrics.increment('identity_logins_total', { amr: 'pwd' })
+        ctx.log.info('email verified', { audit: 'email_verified', userId: user.id })
+        return {
+          status: 200,
+          body: {
+            accessToken,
+            refreshToken: session.refreshToken,
+            expiresIn,
+            // Carries `emailVerifiedAt`, which is the stamp the redemption just wrote — the client
+            // renders "verified" from the same row it signs in with.
+            user: toPublicUser(user),
+            newDevice: session.newDevice,
+          },
+        }
+      } finally {
+        done()
+      }
+    }),
+
+    /**
+     * Ask for another verification link. **Always 202, and always in the same time.**
+     *
+     * The shape is `POST /auth/password/forgot`'s, copied deliberately: answer before doing any
+     * work, one fixed string for every branch. The lookup below is the last thing on the request
+     * path that depends on whether the account exists — everything after it happens only for one
+     * that does, so awaiting it would make the RESPONSE TIME say what the status and the body are
+     * written not to. Measured on Nimbus's equivalent, an unknown address answered in 10ms and a
+     * known one in 6015ms once a mail relay was slow.
+     *
+     * This route has a second oracle the reset route does not: whether the account is ALREADY
+     * verified. It is answered the same way — nothing is said, and the already-verified branch does
+     * the same amount of nothing as the unknown-address branch.
+     */
+    define('POST', '/auth/email/verify/resend', async (ctx, deps) => {
+      const body = await readJson(ctx.req)
+      // `identifier`, the same field name the sign-in form posts, so the client can resend from the
+      // refusal without re-asking the user for anything. An email or a handle: someone who signed
+      // up with a handle and cannot sign in has only that to offer.
+      const raw = optionalString(body, 'identifier')
+      const identifier = raw?.trim() ?? ''
+      const kind: 'email' | 'handle' = identifier.includes('@') ? 'email' : 'handle'
+      // Normalised through contracts-auth, never by hand: `findUserByIdentifier` matches the column
+      // that holds exactly one spelling, and this file having its own idea of what lowercasing
+      // means is how `Sam@example.com` becomes reachable by one route and not by another —
+      // users.ts:4-11 names that as the live defect this service exists to close.
+      const user =
+        identifier.length === 0
+          ? null
+          : await findUserByIdentifier(
+              deps.sql,
+              kind === 'email' ? normaliseEmail(identifier) : normaliseHandle(identifier),
+              kind,
+            )
+
+      // Already verified is not an error and not a resend: the link would sign in whoever asked for
+      // it, so mailing one to an account that no longer needs it is a credential sent to an address
+      // on the strength of an unauthenticated request naming it.
+      if (!user || user.email_verified_at !== null || signInRefusal(user) === 'deleted') {
+        ctx.log.warn('verification resend requested for an account that cannot use one')
+        return { status: 202, body: { status: VERIFICATION_RESEND_STATUS } }
+      }
+      return {
+        status: 202,
+        body: { status: VERIFICATION_RESEND_STATUS },
+        after: async () => {
+          try {
+            const issued = await requestEmailVerification(deps.sql, user, ctx.requestId)
+            reportVerificationDelivery(ctx.log, { userId: user.id, linkable: issued.linkable })
+          } catch (err) {
+            // The response is already on the wire; there is no request left to fail.
+            //
+            // `err` cannot carry the token, and that was checked rather than assumed: postgres.js
+            // hangs `query` and `parameters` off its errors, and one of those parameters is the
+            // event payload, which contains the link. `redactValue` reduces anything
+            // `instanceof Error` to exactly `{ name, message, stack }` — every other property is
+            // dropped before a line is written (runtime/packages/telemetry/src/index.ts:95-101).
+            ctx.log.error('verification resend threw', { err, userId: user.id })
+          }
+        },
       }
     }),
 
@@ -835,8 +1005,19 @@ function buildRoutes(): Route[] {
         }
 
         // Status is checked only after the password, so "this account is suspended" is never said
-        // to an unproven caller — it would tell them the address exists and is worth attacking.
+        // to an unproven caller — it would tell them the address exists and is worth attacking. The
+        // unverified refusal is subject to exactly the same rule and is checked in the same place:
+        // answering "that address has not been confirmed" before the password would turn this route
+        // into an oracle for which addresses have accounts waiting on a link.
         const refusal = signInRefusal(user)
+        if (refusal === 'unverified') {
+          deps.metrics.increment('identity_login_failures_total', { reason: refusal })
+          // Its own code, because the client can act on this one — see `EmailUnverifiedError`. The
+          // resend route takes the identifier this caller has already typed.
+          throw new EmailUnverifiedError(
+            'confirm your email address before signing in; the link was sent when the account was created',
+          )
+        }
         if (refusal) {
           deps.metrics.increment('identity_login_failures_total', { reason: refusal })
           throw new ForbiddenError(`this account is ${refusal}`)

@@ -218,12 +218,23 @@ export async function findUserByIdentifier(
  * caller tells them the address exists and that it is worth attacking. Returning a reason code
  * rather than a boolean so the route can say something true to a user who genuinely is suspended,
  * once they have proved they own it.
+ *
+ * **`unverified` is the same rule applied to a new defect.** `email_verified_at` has existed since
+ * migration 3 and this function did not look at it, so an address nobody had proved control of
+ * signed in exactly like one that had — confirmed against the live estate, where `POST /auth/login`
+ * answered 200 with `emailVerifiedAt: null`. It is last in the order below for the reason the
+ * paragraph above gives, twice over: it is checked after the PASSWORD, like every other refusal
+ * here, and after the STATUS, because "suspended" is the more specific and more actionable of the
+ * two answers and a tombstoned row (deletion.ts:192 nulls the column) would otherwise report the
+ * wrong one.
  */
-export function signInRefusal(user: UserRow): 'suspended' | 'locked' | 'deleted' | null {
-  if (user.status === 'active') return null
-  if (user.status === 'pending_deletion') return null
+export function signInRefusal(user: UserRow): 'suspended' | 'locked' | 'deleted' | 'unverified' | null {
   if (user.status === 'deleted') return 'deleted'
-  return user.status
+  if (user.status !== 'active' && user.status !== 'pending_deletion') return user.status
+  // The grace window is only meaningful if the real owner can get back in during it, so
+  // `pending_deletion` still authenticates — see the cancel route in server.ts.
+  if (user.email_verified_at === null) return 'unverified'
+  return null
 }
 
 /**

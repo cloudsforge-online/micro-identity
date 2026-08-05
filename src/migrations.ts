@@ -707,6 +707,78 @@ export const MIGRATIONS: readonly Migration[] = [
         for each row execute function users_roles_need_a_grant();
     `,
   },
+  {
+    version: 13,
+    name: 'email_verification',
+    // The column `users.email_verified_at` has existed since migration 3 and NOTHING EVER WROTE IT.
+    // `toPublicUser` surfaced it as `emailVerifiedAt` (users.ts:56), every account read `null`, and
+    // `signInRefusal` (users.ts:222) never looked at it — so registration minted a session on the
+    // spot and an address nobody had proved control of signed in for ever. Verified against the live
+    // estate before this migration was written: a registration against
+    // https://nimbus.cloudsforge.online/auth/register was followed by a 200 from `POST /auth/login`
+    // carrying `emailVerifiedAt: null`.
+    //
+    // ## The token table
+    //
+    // The same shape as `password_reset_tokens` (migration 8) and for the same three reasons: only
+    // the hash is stored, so not even an operator with database access can recover an issued link;
+    // the primary key is that hash, so redemption is one indexed equality against a value that says
+    // nothing about how much of a guess was right; and single use is a conditional UPDATE rather
+    // than a read followed by a write.
+    //
+    // It differs in one deliberate way — `email_verification_tokens_one_live`. See below.
+    //
+    // ## The backfill, and why it is not a softening of the policy
+    //
+    // Every row that exists when this runs was created by a service that had no verification at all,
+    // so no live address on the platform has ever been offered a link and none can be retro-actively
+    // proved. Constraining them instead of backfilling would sign out every existing account
+    // including the bootstrap administrator (migration 12), and would do it in an estate where the
+    // consumer of `identity.email.verification_requested` is not deployed yet — so the accounts
+    // locked out would have no way whatsoever to get back in. `created_at`, not `now()`: the claim
+    // being recorded is "this account predates verification", and stamping it with the migration's
+    // own clock would assert that every historical user proved their address the day of the deploy.
+    //
+    // Normalise, THEN constrain — the same order migration 10 uses for `lower(email)`, for the same
+    // reason. The refusal in `signInRefusal` is the constraint here and it is in code rather than in
+    // DDL, so the ordering is between this migration and the deploy of the code that reads it; a
+    // rolling deploy therefore backfills before any replica refuses anyone.
+    up: `
+      create table if not exists email_verification_tokens (
+        -- Only the hash, exactly as password_reset_tokens does it.
+        token_hash  text        primary key,
+        user_id     uuid        not null references users (id) on delete cascade,
+        expires_at  timestamptz not null,
+        -- Stamped by the redemption UPDATE, and by a supersession. Null means live.
+        consumed_at timestamptz,
+        created_at  timestamptz not null default now()
+      );
+
+      -- ONE LIVE TOKEN PER ACCOUNT, AND IT IS AN INDEX RATHER THAN A CHECK IN CODE.
+      --
+      -- "Two live verification tokens for one account" is the state a resend race produces, and the
+      -- older of the two is the one most likely to have leaked into a mail client, a chat log or a
+      -- scanner's cache. emailVerification.ts supersedes under an advisory lock so the race cannot
+      -- happen — and this index means that even if a future edit drops the lock, the
+      -- second insert raises 23505 instead of quietly creating the state. The wrong state has no
+      -- representation rather than being merely checked for.
+      --
+      -- PARTIAL, and that is not a detail: a plain unique index on user_id would make an account
+      -- verifiable exactly once for the lifetime of the database, so every resend, every
+      -- supersession and every re-verification after an address change would fail at 23505.
+      create unique index if not exists email_verification_tokens_one_live
+        on email_verification_tokens (user_id) where consumed_at is null;
+
+      -- Consumed rows are outside the partial index above, and erasure (deletion.ts) deletes by
+      -- user_id across all of them.
+      create index if not exists email_verification_tokens_user_idx
+        on email_verification_tokens (user_id);
+
+      update users
+         set email_verified_at = created_at
+       where email_verified_at is null and status <> 'deleted';
+    `,
+  },
 ]
 
 /**

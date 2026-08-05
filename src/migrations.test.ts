@@ -68,6 +68,7 @@ test('every table the service reads or writes is created', () => {
     'auth_exchange_codes',
     'service_token_issues',
     'platform_role_grants',
+    'email_verification_tokens',
   ]) {
     assert.match(sql, new RegExp(`create table if not exists ${table}\\b`), `${table} is missing`)
   }
@@ -236,6 +237,48 @@ test('BOOTSTRAP: the grant survives its user — no cascade erases the record of
   assert.match(roleGrants.up, /user_id     uuid        not null references users \(id\),/)
   const statements = statementsOf(roleGrants.up)
   assert.ok(!statements.includes('on delete cascade'), 'a cascade would delete the audit trail')
+})
+
+/* ------------------------------------------------- email verification (migration 13) */
+
+const emailVerification = MIGRATIONS.find((m) => m.name === 'email_verification')!
+
+test('EMAIL VERIFICATION: one live token per account, enforced by a PARTIAL unique index', () => {
+  // The mechanism that makes "two live verification tokens for one account" unrepresentable rather
+  // than merely guarded against in code. `emailVerification.test.ts` proves the behaviour against a
+  // real Postgres; this reads the DDL, which is where an absence can be asserted.
+  assert.match(
+    emailVerification.up,
+    /create unique index if not exists email_verification_tokens_one_live\s+on email_verification_tokens \(user_id\) where consumed_at is null;/,
+  )
+  // PARTIAL is the whole of it. A plain unique on user_id would cap an account at one verification
+  // for the life of the database, so every resend and every supersession would fail at 23505.
+  assert.doesNotMatch(
+    statementsOf(emailVerification.up),
+    /create unique index[^;]*email_verification_tokens \(user_id\);/,
+  )
+})
+
+test('EMAIL VERIFICATION: only the hash is stored, and the token has an expiry and a consumed stamp', () => {
+  assert.match(emailVerification.up, /token_hash  text        primary key/)
+  assert.match(emailVerification.up, /expires_at  timestamptz not null/)
+  assert.match(emailVerification.up, /consumed_at timestamptz/)
+  // A column that could hold the token itself is the one thing that would undo the design.
+  assert.doesNotMatch(statementsOf(emailVerification.up), /\btoken\s+text\b/)
+})
+
+test('EMAIL VERIFICATION: existing accounts are backfilled, and stamped with their own creation', () => {
+  // Without this every account on the platform — the bootstrap administrator included — is refused
+  // at sign-in the moment the refusal ships, in an estate where nothing yet delivers the link they
+  // would need. Normalise, THEN constrain, exactly as migration 10 does for lower(email).
+  assert.match(
+    emailVerification.up,
+    /update users\s+set email_verified_at = created_at\s+where email_verified_at is null and status <> 'deleted';/,
+  )
+  // `created_at` rather than `now()`: the claim is "this account predates verification", and the
+  // migration's own clock would instead assert that every historical user proved their address on
+  // the day of the deploy.
+  assert.doesNotMatch(statementsOf(emailVerification.up), /set email_verified_at = now\(\)/)
 })
 
 test('nothing stores a credential in the clear', () => {

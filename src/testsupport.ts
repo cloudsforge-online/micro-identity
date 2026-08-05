@@ -45,6 +45,13 @@ process.env['IDENTITY_DATABASE_URL'] ??= url ?? 'postgres://cloudsforge@127.0.0.
 process.env['IDENTITY_ISSUER'] ??= 'https://identity.test.cloudsforge.local'
 process.env['IDENTITY_KEY_SECRET'] ??= 'test-key-secret-0123456789abcdef0123456789'
 process.env['IDENTITY_PUBLIC_URL'] ??= 'https://account.test.cloudsforge.local'
+/*
+ * Hub's origin, so the suite exercises the branch a configured deployment runs: a verification
+ * event that carries a `verifyUrl`. The unset branch is not tested by unsetting this — `env.ts`
+ * validates at import and a test cannot take a variable back afterwards — but through
+ * `buildVerifyUrl`, which takes the origin as an argument for exactly that reason.
+ */
+process.env['IDENTITY_ACCOUNT_URL'] ??= 'https://hub.test.cloudsforge.local'
 process.env['IDENTITY_HANDOFF_ORIGINS'] ??= 'https://app.test.cloudsforge.local,https://play.test.cloudsforge.local'
 process.env['OUTBOX_SIGNING_SECRET'] ??= 'test-outbox-signing-secret-0123456789'
 process.env['IDENTITY_SERVICE_TOKEN_GRANTS'] ??= JSON.stringify({
@@ -69,6 +76,7 @@ const ALL_TABLES = [
   'memberships',
   'organisations',
   'password_reset_tokens',
+  'email_verification_tokens',
   'auth_exchange_codes',
   'login_attempts',
   'service_token_issues',

@@ -29,6 +29,7 @@ import { Logger, Metrics, registerHttpMetrics, registerJobMetrics } from '@cloud
 import { SCOPE_NAMES } from '@cloudsforge/contracts-auth'
 import type postgres from 'postgres'
 import { createServer, registerServiceMetrics } from './server.ts'
+import { requestEmailVerification } from './emailVerification.ts'
 import { WEBAUTHN_NOT_IMPLEMENTED } from './mfa.ts'
 import { DEFAULT_PARAMS, base32Decode, totp } from './totp.ts'
 import { ROTATION_GRACE_MS } from './tokens.ts'
@@ -123,17 +124,44 @@ interface Registered {
   readonly refreshToken: string
 }
 
+/**
+ * A registered AND verified account, which is what most of this file needs to talk about.
+ *
+ * Registration answers 202 and mints nothing now — the account exists unverified and cannot sign
+ * in. Everything below that is about sessions, MFA, organisations or deletion starts from a person
+ * who has been through the whole front door, so the helper walks the link too.
+ */
 async function register(): Promise<Registered> {
   const email = freshEmail()
   const handle = freshHandle()
   const response = await call('POST', '/auth/register', {
     body: { email, handle, password: GOOD_PASSWORD },
   })
-  assert.equal(response.status, 201, JSON.stringify(response.body))
+  assert.equal(response.status, 202, JSON.stringify(response.body))
+  return { email, handle, ...(await verifyEmail(email)) }
+}
+
+/**
+ * Spend a verification link the way the Hub page does: mint, then POST the token.
+ *
+ * **The token is produced by the code under test rather than written here.** It cannot be read back
+ * out of the database — only its SHA-256 is stored, which is the property the whole design rests on
+ * — so the suite calls the real mint and uses what it returns. That also means this walks the same
+ * supersession path a resend does: the token registration minted is burned by this one.
+ */
+async function verifyEmail(
+  email: string,
+  headers: Record<string, string> = {},
+): Promise<{ userId: string; accessToken: string; refreshToken: string }> {
+  const rows = await sql<{ id: string; handle: string; email: string }[]>`
+    select id, handle, email from users where email = lower(${email})
+  `
+  const user = rows[0]!
+  const { token } = await requestEmailVerification(db, user)
+  const response = await call('POST', '/auth/email/verify', { body: { token }, headers })
+  assert.equal(response.status, 200, JSON.stringify(response.body))
   return {
-    email,
-    handle,
-    userId: (response.body['user'] as { id: string }).id,
+    userId: user.id,
     accessToken: response.body['accessToken'] as string,
     refreshToken: response.body['refreshToken'] as string,
   }
@@ -267,10 +295,11 @@ test('the access token names the session, and signing out of it stops the refres
     body: { email, handle, password: GOOD_PASSWORD },
     headers: { 'x-forwarded-for': '198.51.100.77' },
   })
-  const registered = {
-    accessToken: created.body['accessToken'] as string,
-    refreshToken: created.body['refreshToken'] as string,
-  }
+  assert.equal(created.status, 202)
+  // The session is created by the VERIFICATION now, not by the registration, so the client context
+  // this test is about — the address the device and the session record — is the one that spends the
+  // link. Same browser, same address; the assertions below are unchanged.
+  const registered = await verifyEmail(email, { 'x-forwarded-for': '198.51.100.77' })
 
   const claims = decodeJwt(registered.accessToken)
   const sessions = await call('GET', '/sessions', { token: registered.accessToken })
@@ -439,6 +468,234 @@ test('removing the last factor is 403 without the password and 200 with it', { s
   })
   assert.equal(removed.status, 200)
   assert.equal(removed.body['wasLastActive'], true)
+})
+
+/* ------------------------------------------------------------------ email verification */
+
+/** The hash of the one live verification token for an address, or null. Never a raw token. */
+async function liveVerificationHash(email: string): Promise<string | null> {
+  const rows = await sql<{ token_hash: string }[]>`
+    select t.token_hash from email_verification_tokens t
+      join users u on u.id = t.user_id
+     where t.consumed_at is null and t.expires_at > now() and u.email = lower(${email})
+  `
+  assert.ok(rows.length <= 1, 'one live token per account is a database constraint')
+  return rows[0]?.token_hash ?? null
+}
+
+/*
+ * The owner's report, from the live product: "i didn't receive any registration email and i was
+ * able to login directly." Both halves are asserted below — registration mints nothing, and sign-in
+ * is refused until the link is spent.
+ */
+
+test('registration answers 202 and mints NO session at all', { skip }, async () => {
+  const email = freshEmail()
+  const response = await call('POST', '/auth/register', {
+    body: { email, handle: freshHandle(), password: GOOD_PASSWORD },
+  })
+
+  assert.equal(response.status, 202)
+  assert.equal(response.body['verificationRequired'], true)
+  // The normalised address, so "check your email" names the inbox the mail actually went to.
+  assert.equal(response.body['email'], email.toLowerCase())
+  assert.match(response.body['status'] as string, /verification link/)
+
+  // The defect, asserted as the absence it is. These two fields being present is what let an
+  // unproved address use the platform.
+  assert.equal(response.body['accessToken'], undefined, 'registration must not mint a session')
+  assert.equal(response.body['refreshToken'], undefined)
+
+  // And not merely absent from the body: no session row exists to be resumed by any other route.
+  const sessions = await sql<{ id: string }[]>`
+    select s.id from sessions s join users u on u.id = s.user_id where u.email = ${email.toLowerCase()}
+  `
+  assert.equal(sessions.length, 0)
+  const user = (await sql<{ email_verified_at: Date | null }[]>`
+    select email_verified_at from users where email = ${email.toLowerCase()}
+  `)[0]!
+  assert.equal(user.email_verified_at, null, 'the account exists and is unverified')
+})
+
+test('an unverified account is refused at sign-in — and a verified one is not', { skip }, async () => {
+  const email = freshEmail()
+  const handle = freshHandle()
+  assert.equal(
+    (await call('POST', '/auth/register', { body: { email, handle, password: GOOD_PASSWORD } })).status,
+    202,
+  )
+
+  const refused = await call('POST', '/auth/login', { body: { identifier: email, password: GOOD_PASSWORD } })
+  assert.equal(refused.status, 403)
+  const error = refused.body['error'] as Record<string, unknown>
+  // A code the client can branch on, because there is something useful to offer: a resend. A bare
+  // `forbidden` tells a sign-in form to give up.
+  assert.equal(error['code'], 'email_unverified')
+  assert.ok(error['requestId'], "the estate's envelope is { error: { code, message, requestId } }")
+  assert.equal(refused.body['accessToken'], undefined)
+
+  // THE OTHER HALF, and it is what stops this test passing against a service that refuses
+  // everyone: the SAME account, the SAME password, after the link is spent.
+  await verifyEmail(email)
+  const allowed = await call('POST', '/auth/login', { body: { identifier: email, password: GOOD_PASSWORD } })
+  assert.equal(allowed.status, 200, JSON.stringify(allowed.body))
+  assert.ok(allowed.body['accessToken'])
+})
+
+test('the verification link signs the user in, and the link then works no more', { skip }, async () => {
+  const email = freshEmail()
+  const handle = freshHandle()
+  await call('POST', '/auth/register', { body: { email, handle, password: GOOD_PASSWORD } })
+
+  const userId = (await sql<{ id: string }[]>`select id from users where email = ${email.toLowerCase()}`)[0]!.id
+  // Minted by the code under test — the table holds only a SHA-256, so there is no other way to
+  // obtain one, and a literal here would be a token that could never redeem.
+  const { token } = await requestEmailVerification(db, { id: userId, handle, email: email.toLowerCase() })
+
+  const verified = await call('POST', '/auth/email/verify', { body: { token } })
+  assert.equal(verified.status, 200)
+  assert.ok(verified.body['accessToken'])
+  assert.ok(verified.body['refreshToken'])
+  assert.equal(verified.body['expiresIn'], 900)
+  const user = verified.body['user'] as Record<string, unknown>
+  assert.equal(user['id'], userId)
+  assert.ok(user['emailVerifiedAt'], 'the response carries the stamp that was just written')
+
+  // An ordinary session, indistinguishable from one a sign-in would have made: it lists, it
+  // refreshes, and it carries `pwd` rather than some second credential kind.
+  const claims = decodeJwt(verified.body['accessToken'] as string)
+  assert.deepEqual(claims['amr'], ['pwd'])
+  const sessions = await call('GET', '/sessions', { token: verified.body['accessToken'] as string })
+  assert.equal((sessions.body['sessions'] as unknown[]).length, 1)
+
+  // Single use, driven: the same link again. Two people holding one link must not both get in.
+  const again = await call('POST', '/auth/email/verify', { body: { token } })
+  assert.equal(again.status, 401)
+  assert.equal((again.body['error'] as Record<string, unknown>)['code'], 'unauthenticated')
+})
+
+test('a token that was never real is refused exactly like a spent one', { skip }, async () => {
+  const invented = await call('POST', '/auth/email/verify', { body: { token: 'not-a-token-anyone-issued' } })
+  assert.equal(invented.status, 401)
+  // Expired, spent and never real read identically. Separating them would tell a guesser that a
+  // guess had once been right.
+  assert.equal(
+    (invented.body['error'] as Record<string, unknown>)['message'],
+    'that verification link is invalid or has expired',
+  )
+  // A missing token is a malformed request rather than a refusal, which says nothing about tokens.
+  assert.equal((await call('POST', '/auth/email/verify', { body: {} })).status, 400)
+})
+
+test('there is NO GET route that spends a verification token', { skip }, async () => {
+  // The link a scanner pre-fetches is a page on Hub, not a route here. If this service ever grows a
+  // GET that consumes a token, a corporate mail filter opening the link burns it before the user
+  // ever sees the email — and the user's own report is that the account "does not work".
+  assert.equal((await call('GET', '/auth/email/verify?token=anything')).status, 404)
+  assert.equal((await call('GET', '/auth/email/verify')).status, 404)
+})
+
+test('resend is an oracle in neither status nor body, whatever the account is', { skip }, async () => {
+  const unverifiedEmail = freshEmail()
+  await call('POST', '/auth/register', {
+    body: { email: unverifiedEmail, handle: freshHandle(), password: GOOD_PASSWORD },
+  })
+  const verified = await register()
+  // Registration ALREADY minted a live token for the unverified account, so "a live token exists"
+  // is true whether or not this route does anything — which is how the first version of this test
+  // passed against a resend route that had been mutated to do nothing at all. What proves the work
+  // happened is that the live token is a DIFFERENT one afterwards.
+  const before = await liveVerificationHash(unverifiedEmail)
+  assert.ok(before, 'registration mints one')
+
+  const bodies: string[] = []
+  for (const identifier of [
+    unverifiedEmail, // exists and needs a link
+    verified.email, // exists and does not
+    verified.handle, // the same account, by handle
+    freshEmail(), // no such account
+    'not-an-address', // not even well formed
+  ]) {
+    const response = await call('POST', '/auth/email/verify/resend', { body: { identifier } })
+    assert.equal(response.status, 202, `${identifier} must not be distinguishable by status`)
+    bodies.push(JSON.stringify(response.body))
+  }
+  // A missing identifier gets the same answer as a present one, for the same reason.
+  const empty = await call('POST', '/auth/email/verify/resend', { body: {} })
+  assert.equal(empty.status, 202)
+  bodies.push(JSON.stringify(empty.body))
+
+  assert.equal(new Set(bodies).size, 1, `every branch must answer identically: ${bodies.join(' | ')}`)
+
+  // And the work still happened for the one account that needed it — otherwise this is a test of a
+  // route that always answers 202 and never does anything, which is the shape of Nimbus's
+  // forgot-password defect.
+  await new Promise((resolve) => setTimeout(resolve, 300))
+  const after = await liveVerificationHash(unverifiedEmail)
+  assert.ok(after, 'answering first must not mean never doing the work')
+  assert.notEqual(after, before, 'a resend mints a NEW link and supersedes the old one')
+
+  // Nothing was minted for the account that is already verified: that link would sign in whoever
+  // asked for it, and the request naming the address is unauthenticated.
+  const forVerified = await sql<{ user_id: string }[]>`
+    select user_id from email_verification_tokens
+     where user_id = ${verified.userId} and consumed_at is null
+  `
+  assert.equal(forVerified.length, 0)
+})
+
+test('the link that LEAVES the service is the one that signs the user in', { skip }, async () => {
+  // The whole journey, walked through the seam rather than around it: register, be refused, ask for
+  // another link, take the URL out of the event `notify` will render, and spend it.
+  //
+  // This is the one test that reads a token the way a recipient does. Everywhere else the suite
+  // mints through the module, which proves the route but not the payload — and a `verifyUrl` that
+  // is subtly wrong (identity's own origin, a query string, an un-encoded token) would pass every
+  // other test in this file while mailing every user a link that does nothing.
+  const email = freshEmail()
+  await call('POST', '/auth/register', {
+    body: { email, handle: freshHandle(), password: GOOD_PASSWORD },
+  })
+  assert.equal(
+    (await call('POST', '/auth/login', { body: { identifier: email, password: GOOD_PASSWORD } })).status,
+    403,
+  )
+  assert.equal(
+    (await call('POST', '/auth/email/verify/resend', { body: { identifier: email } })).status,
+    202,
+  )
+  await new Promise((resolve) => setTimeout(resolve, 300))
+
+  const events = await sql<{ payload: Record<string, unknown> }[]>`
+    select payload from outbox
+     where topic = 'identity.email.verification_requested' order by occurred_at desc limit 1
+  `
+  const verifyUrl = events[0]!.payload['verifyUrl'] as string
+  assert.match(verifyUrl, /^https:\/\/hub\.test\.cloudsforge\.local\/account\/verify#token=/)
+  // Exactly what the Hub page does: read `location.hash`, post what is after it. The token is in
+  // the FRAGMENT, so nothing between the mailbox and the browser ever saw it.
+  const token = decodeURIComponent(new URL(verifyUrl).hash.slice('#token='.length))
+
+  const verified = await call('POST', '/auth/email/verify', { body: { token } })
+  assert.equal(verified.status, 200, JSON.stringify(verified.body))
+  const me = await call('GET', '/auth/me', { token: verified.body['accessToken'] as string })
+  assert.equal(me.status, 200)
+  assert.ok((me.body['user'] as Record<string, unknown>)['emailVerifiedAt'])
+})
+
+test('asking for another link is throttled per address', { skip }, async () => {
+  const from = { 'x-forwarded-for': '198.51.100.201' }
+  const statuses: number[] = []
+  for (let attempt = 0; attempt < 7; attempt += 1) {
+    statuses.push(
+      (await call('POST', '/auth/email/verify/resend', { body: { identifier: freshEmail() }, headers: from }))
+        .status,
+    )
+  }
+  // Uncapped, this route is a way to make the estate send mail to a third party repeatedly — so it
+  // carries the same 5 that `/auth/password/forgot` and `/auth/register` do.
+  assert.equal(statuses.filter((s) => s === 202).length, 5, 'five, then refusals')
+  assert.ok(statuses.includes(429))
 })
 
 /* ------------------------------------------------------------------ password recovery */
@@ -977,7 +1234,17 @@ test('a tombstone keeps only the id and the dates, and frees the address for reu
    * do it was a bug: every one of these declares `on delete cascade` from `users`, which is right
    * for a hard delete and does nothing at all for a tombstone. An UPDATE fires no cascade, so the
    * profile — display name, bio, country, links — survived erasure on a row marked `deleted`. */
-  for (const table of ['profiles', 'devices', 'sessions', 'mfa_factors', 'mfa_challenges', 'password_reset_tokens']) {
+  for (const table of [
+    'profiles',
+    'devices',
+    'sessions',
+    'mfa_factors',
+    'mfa_challenges',
+    'password_reset_tokens',
+    // Consumed as well as live. A spent verification row is still a row that says this address
+    // existed and when it was proved, on an account whose status says the person is gone.
+    'email_verification_tokens',
+  ]) {
     const remaining = await sql.unsafe(`select 1 from ${table} where user_id = $1`, [registered.userId])
     assert.equal((remaining as unknown[]).length, 0, `${table} still holds personal data`)
   }
@@ -992,7 +1259,7 @@ test('a tombstone keeps only the id and the dates, and frees the address for reu
   const again = await call('POST', '/auth/register', {
     body: { email: registered.email, handle: freshHandle(), password: GOOD_PASSWORD },
   })
-  assert.equal(again.status, 201)
+  assert.equal(again.status, 202)
 })
 
 test('a sole owner of a team cannot delete until they have handed it over', { skip }, async () => {
@@ -1041,7 +1308,7 @@ test('one address cannot register without bound', { skip }, async () => {
       assert.equal((response.body['error'] as Record<string, unknown>)['code'], 'rate_limited')
     }
   }
-  assert.equal(statuses.filter((s) => s === 201).length, 5, 'five, then refusals')
+  assert.equal(statuses.filter((s) => s === 202).length, 5, 'five, then refusals')
   assert.ok(statuses.includes(429))
 
   // Keyed per route AND per address, so exhausting one route does not lock a caller out of the
