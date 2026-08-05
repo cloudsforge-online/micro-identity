@@ -100,6 +100,67 @@ function optional(source: Source, name: string, fallback: string): string {
   return value && value.length > 0 ? value : fallback
 }
 
+const KEY_SECRET_PREFIX = 'IDENTITY_KEY_SECRET_V'
+const LEGACY_KEY_SECRET = 'IDENTITY_KEY_SECRET'
+
+/**
+ * The key-encryption keyring: every `IDENTITY_KEY_SECRET_V<n>` present, plus the version that seals.
+ *
+ * **THE UNSUFFIXED NAME IS ACCEPTED AS V1, AND THAT IS LOAD-BEARING.** Every blob in both live
+ * databases was sealed as `v1:` under the value `IDENTITY_KEY_SECRET` held, and `keyEnvelope.ts`
+ * derives from the unchanged salt `identity:v1:<purpose>:<id>`. So the same value under the name
+ * `IDENTITY_KEY_SECRET_V1` — or left exactly where it is — opens those blobs byte-identically.
+ * Without this branch, shipping #188's fix would itself be the destructive rotation it exists to
+ * prevent: every existing deployment would boot with an empty keyring and fail to open anything.
+ *
+ * Empty means unset, matching `optional` above, because a compose interpolation of an unset
+ * variable arrives as an empty string rather than as an absent one. That is safe here only because
+ * the write version must be present in the map — an empty `_V2` cannot silently downgrade writes
+ * back to v1, it fails to boot.
+ */
+function parseKeySecrets(source: Source): { keySecrets: ReadonlyMap<number, string>; keyVersion: number } {
+  const secrets = new Map<number, string>()
+
+  for (const name of Object.keys(source)) {
+    if (!name.startsWith(KEY_SECRET_PREFIX)) continue
+    const suffix = name.slice(KEY_SECRET_PREFIX.length)
+    if (!/^[0-9]{1,3}$/.test(suffix)) continue
+    const version = Number(suffix)
+    if (version < 1) throw new EnvError(`${name}: envelope versions start at 1`)
+    if (!(source[name]?.trim())) continue
+    // 32 rather than the default 24: see the `keySecrets` field comment.
+    secrets.set(version, requiredSecret(source, name, 32))
+  }
+
+  const legacy = source[LEGACY_KEY_SECRET]?.trim()
+  if (legacy) {
+    const explicit = secrets.get(1)
+    if (explicit !== undefined && explicit !== legacy) {
+      // Two different values both claiming v1 is unresolvable, and guessing would silently pick the
+      // one that fails to open half the blobs. Names the variables, never either value.
+      throw new EnvError(
+        `${LEGACY_KEY_SECRET} and ${KEY_SECRET_PREFIX}1 are both set and differ — keep ${KEY_SECRET_PREFIX}1 and remove the unsuffixed one`,
+      )
+    }
+    if (explicit === undefined) secrets.set(1, requiredSecret(source, LEGACY_KEY_SECRET, 32))
+  }
+
+  if (secrets.size === 0) {
+    throw new EnvError(
+      `${KEY_SECRET_PREFIX}1 is required — ${SERVICE} refuses to start without a key-encryption key`,
+    )
+  }
+
+  const highest = Math.max(...secrets.keys())
+  const keyVersion = integer(source, 'IDENTITY_KEY_VERSION', highest, 1, 999)
+  if (!secrets.has(keyVersion)) {
+    throw new EnvError(
+      `IDENTITY_KEY_VERSION is ${keyVersion} but ${KEY_SECRET_PREFIX}${keyVersion} is not set — this process would seal blobs it cannot open`,
+    )
+  }
+  return { keySecrets: secrets, keyVersion }
+}
+
 function integer(source: Source, name: string, fallback: number, min: number, max: number): number {
   const raw = source[name]?.trim()
   if (!raw) return fallback
@@ -195,12 +256,30 @@ export interface Env {
    */
   readonly issuer: string
   /**
-   * Wraps the RS256 private half, AES-256-GCM under a scrypt-derived key (see keyEnvelope.ts).
+   * The key-encryption keys, BY VERSION — `IDENTITY_KEY_SECRET_V<n>`.
    *
-   * The longest secret this service takes, because it is the one whose disclosure is unbounded: it
-   * is not a password to something, it is the key to the key every service in the estate trusts.
+   * Wraps the RS256 private half and every TOTP seed, AES-256-GCM under a scrypt-derived key (see
+   * keyEnvelope.ts). The longest secret this service takes, because it is the one whose disclosure
+   * is unbounded: it is not a password to something, it is the key to the key every service in the
+   * estate trusts.
+   *
+   * A MAP rather than a string, and that is #188's fix. One value meant a rotation destroyed every
+   * TOTP seed in the estate — unrecoverably, because the seed exists only in that blob and in the
+   * user's authenticator. Holding every version at once is what lets a blob written under the old
+   * secret still open while new blobs are written under the new one, which is the only way the
+   * drain in `rewrap.ts` can run at all.
    */
-  readonly keySecret: string
+  readonly keySecrets: ReadonlyMap<number, string>
+  /**
+   * The version new blobs are SEALED under. Must be present in `keySecrets`.
+   *
+   * Defaults to the highest version supplied, so a deployment holding one secret needs no new
+   * variable. **Adding `IDENTITY_KEY_SECRET_V<n+1>` therefore promotes the write version on the
+   * next restart** — deliberate, because the alternative is a rotation that silently keeps writing
+   * under the compromised key, but it does mean the old image must keep V<n+1> in its environment
+   * if the deploy is rolled back after any blob has been written under it.
+   */
+  readonly keyVersion: number
   /**
    * Where password-reset links point. **Never the request `Host` header** (SD-04).
    *
@@ -285,8 +364,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     // service that exhausts Postgres for everything else the moment it scales.
     databasePoolMax: integer(source, 'IDENTITY_DATABASE_POOL_MAX', 10, 1, 500),
     issuer: required(source, 'IDENTITY_ISSUER'),
-    // 32 rather than the default 24: see the field comment.
-    keySecret: requiredSecret(source, 'IDENTITY_KEY_SECRET', 32),
+    ...parseKeySecrets(source),
     publicUrl: origin('IDENTITY_PUBLIC_URL', required(source, 'IDENTITY_PUBLIC_URL')),
     accountUrl: accountUrl.length > 0 ? origin('IDENTITY_ACCOUNT_URL', accountUrl) : null,
     handoffOrigins: Object.freeze([...new Set(handoffOrigins)]),

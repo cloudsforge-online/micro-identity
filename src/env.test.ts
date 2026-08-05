@@ -92,6 +92,72 @@ test('the secret the test suite runs under is not itself a placeholder', () => {
   )
 })
 
+/* ───────────────────────────────── the key-encryption keyring (#188) ────────────────────────── */
+
+test('the unsuffixed IDENTITY_KEY_SECRET is accepted as v1', () => {
+  // LOAD-BEARING, not a courtesy. Every blob in both live databases is stamped `v1:` and was sealed
+  // under the value this variable held. If shipping #188's fix required renaming it, the fix would
+  // itself be the destructive rotation it exists to prevent.
+  const env = loadEnv(COMPLETE)
+  assert.deepEqual([...env.keySecrets.keys()], [1])
+  assert.equal(env.keyVersion, 1)
+})
+
+test('the write version defaults to the highest secret supplied', () => {
+  const env = loadEnv({ ...COMPLETE, IDENTITY_KEY_SECRET_V2: 'a-second-key-secret-with-enough-entropy-99' })
+  assert.deepEqual([...env.keySecrets.keys()].sort((a, b) => a - b), [1, 2])
+  // Adding a secret promotes the write version, so a rotation cannot stall half-done with the
+  // service still sealing under the compromised key.
+  assert.equal(env.keyVersion, 2)
+})
+
+test('a write version with no matching secret refuses to boot', () => {
+  // Sealing under a version this process cannot open would manufacture unreadable blobs on purpose
+  // — the exact damage #188 describes, self-inflicted at boot.
+  assert.throws(
+    () => loadEnv({ ...COMPLETE, IDENTITY_KEY_VERSION: '2' }),
+    /IDENTITY_KEY_VERSION is 2 but IDENTITY_KEY_SECRET_V2 is not set/,
+  )
+})
+
+test('two different values both claiming v1 refuse to boot rather than guessing', () => {
+  // Guessing would silently pick the one that fails to open half the blobs, and the symptom would
+  // arrive later, as an authentication failure a long way from its cause.
+  assert.throws(
+    () =>
+      loadEnv({
+        ...COMPLETE,
+        IDENTITY_KEY_SECRET_V1: 'a-different-v1-secret-with-enough-entropy-1',
+      }),
+    /are both set and differ/,
+  )
+  // The same value under both names is not a conflict — that is the intermediate state of renaming.
+  assert.doesNotThrow(() =>
+    loadEnv({ ...COMPLETE, IDENTITY_KEY_SECRET_V1: COMPLETE['IDENTITY_KEY_SECRET']! }),
+  )
+})
+
+test('a versioned key secret is held to the same floor and placeholder rules', () => {
+  assert.throws(
+    () => loadEnv({ ...COMPLETE, IDENTITY_KEY_SECRET_V2: 'x'.repeat(28) }),
+    /at least 32/,
+  )
+  assert.throws(
+    () => loadEnv({ ...COMPLETE, IDENTITY_KEY_SECRET_V2: 'CHANGE_ME_at_least_32_characters_long' }),
+    /known placeholder/,
+  )
+})
+
+test('an empty versioned secret is treated as unset and cannot silently downgrade writes', () => {
+  // A compose interpolation of an unset variable arrives as an empty string, not as an absent one.
+  // Treating it as unset is safe only because the write version must be present in the keyring —
+  // so an empty _V2 fails to boot rather than quietly sealing new blobs back under v1.
+  assert.throws(
+    () => loadEnv({ ...COMPLETE, IDENTITY_KEY_SECRET_V2: '', IDENTITY_KEY_VERSION: '2' }),
+    /IDENTITY_KEY_VERSION is 2 but IDENTITY_KEY_SECRET_V2 is not set/,
+  )
+})
+
 test('the public URL must be an origin, because a reset link is built from it', () => {
   // SD-04: the link is built from configuration and never from the request Host header. A value
   // carrying a path or a query would produce a link that is subtly wrong in a way nobody notices

@@ -208,7 +208,10 @@ test('a blob that is not in the envelope format says so, rather than failing as 
   // The distinction matters at 3am: a GCM authentication error reads like the wrong master secret
   // and sends an operator rotating something that was never the problem.
   assert.throws(() => open('signing-key', 'kid', '{"kty":"RSA"}'), /not in a recognised envelope format/)
-  assert.throws(() => open('signing-key', 'kid', 'v9:AAAA'), /envelope version 9/)
+  // A version this process holds no secret for names the VERSION, not a GCM failure. Since #188 that
+  // is the message an operator sees when they have removed an old key secret before the rewrap pass
+  // finished draining — it tells them which step they skipped.
+  assert.throws(() => open('signing-key', 'kid', 'v9:AAAA'), /no key secret for envelope version v9/)
 })
 
 test('two seals of one value differ, so the ciphertext is not a fingerprint of the plaintext', () => {
