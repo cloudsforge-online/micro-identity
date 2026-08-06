@@ -145,7 +145,7 @@ test('the three topics that were wrong stay fixed', () => {
   assert.ok(emitted.has('identity.mfa.removed'), 'the registered name for a factor being revoked')
   assert.ok(emitted.has('identity.mfa.added'), 'the other half, which notify has always expected')
   assert.equal(isRegisteredTopic('identity.mfa.removed'), true)
-  // contracts has since adopted `added` too (contracts/packages/events/src/index.ts:291), so the
+  // contracts has since adopted `added` too (contracts/packages/events/src/index.ts), so the
   // consumer rule notify has carried all along can finally fire.
   assert.equal(isRegisteredTopic('identity.mfa.added'), true)
 

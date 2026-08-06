@@ -225,7 +225,7 @@ export async function findUserByIdentifier(
  * answered 200 with `emailVerifiedAt: null`. It is last in the order below for the reason the
  * paragraph above gives, twice over: it is checked after the PASSWORD, like every other refusal
  * here, and after the STATUS, because "suspended" is the more specific and more actionable of the
- * two answers and a tombstoned row (deletion.ts:192 nulls the column) would otherwise report the
+ * two answers and a tombstoned row (deletion.ts nulls the column) would otherwise report the
  * wrong one.
  */
 export function signInRefusal(user: UserRow): 'suspended' | 'locked' | 'deleted' | 'unverified' | null {

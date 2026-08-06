@@ -4,9 +4,9 @@
  * ## The defect this closes
  *
  * `users.email_verified_at` has existed since migration 3, `toPublicUser` has published it as
- * `emailVerifiedAt` since the file was written (users.ts:56), and **nothing in this service ever
+ * `emailVerifiedAt` since the file was written (users.ts), and **nothing in this service ever
  * wrote it**. There was no verification route in the whole table, `POST /auth/register` minted a
- * session on the spot (server.ts, the register route), and `signInRefusal` (users.ts:222) refused
+ * session on the spot (server.ts, the register route), and `signInRefusal` (users.ts) refused
  * only `suspended`, `locked` and `deleted` — so an address nobody had proved control of could sign
  * in for ever. Confirmed against the live estate rather than inferred: a registration against
  * https://nimbus.cloudsforge.online/auth/register was followed by a 200 from `POST /auth/login`
@@ -16,7 +16,7 @@
  *
  *     https://hub.<apex>/account/verify#token=<64 hex characters>
  *
- * `resetUrlFor` (passwordReset.ts:98) already puts a reset token after the '#' and records why: a
+ * `resetUrlFor` (passwordReset.ts) already puts a reset token after the '#' and records why: a
  * fragment is the one part of a URL a browser keeps to itself, so it is not in the request line and
  * reaches no server log, no reverse-proxy access log and no `Referer` on the next navigation.
  * Nimbus used `?token=` and its own "incoming request" log line wrote the live credential to stdout
@@ -37,7 +37,7 @@
  * ## Twenty-four hours, not thirty minutes
  *
  * A password reset is requested by someone sitting at the form who is waiting for the mail, so
- * thirty minutes (passwordReset.ts:33) is generous. A verification link is read on a phone, in the
+ * thirty minutes (passwordReset.ts) is generous. A verification link is read on a phone, in the
  * morning, after the mail sat in a provider queue or a spam folder somebody eventually checked.
  * Twenty-four hours is the shortest window that does not routinely fail a person who signs up at
  * night, and the exposure it buys is bounded by everything else here: the token is single-use, it
@@ -52,7 +52,7 @@
  *
  * ## Delivery: the outbox, because identity does not speak SMTP
  *
- * passwordReset.ts:173-179 states the estate's position and this follows it exactly: `notify` owns
+ * passwordReset.ts states the estate's position and this follows it exactly: `notify` owns
  * every outbound channel, so a mail transport here would build the second copy of a thing whose
  * whole purpose is to be the only copy. The fact leaves as `identity.email.verification_requested`
  * through `withOutbox`, in the SAME transaction as the token row — rule 5 of docs/ecosystem/03 §2 —
@@ -68,7 +68,7 @@
  *      travel in the event, and a reset or a verification link IS the parameter.
  *   2. The credential is single-use and expires in 24 hours, and proves control of a mailbox rather
  *      than granting standing access to anything.
- *   3. The alternative is identity speaking SMTP, which passwordReset.ts:173-179 rejects by name —
+ *   3. The alternative is identity speaking SMTP, which passwordReset.ts rejects by name —
  *      duplicated transport, duplicated templates, and a network dependency on the routes whose
  *      timing must not vary.
  */
@@ -105,7 +105,7 @@ export interface IssuedVerification {
  *
  * **THE HOST COMES FROM CONFIGURATION, NOT FROM THE REQUEST.** This takes no request at all, which
  * is stronger than taking one and ignoring it: there is nothing here for a future edit to reach
- * for. passwordReset.ts:12-16 records what the alternative costs — while nothing delivered mail a
+ * for. passwordReset.ts records what the alternative costs — while nothing delivered mail a
  * `Host`-derived link was a latent bug, and wiring a relay turns it into unauthenticated account
  * takeover, because a forged `Host` has the deployment's own relay send the victim a genuine,
  * correctly branded email whose button points at the attacker. For a link that proves control of a
@@ -134,7 +134,7 @@ export function verifyUrlFor(token: string): string | null {
  * Issuing supersedes rather than accumulates: two "resend" clicks must not leave two live tokens,
  * because the older one is the one most likely to have leaked into a mail client, a chat log or a
  * scanner's cache. The advisory lock is required for the reason `createPasswordResetToken` gives at
- * passwordReset.ts:49-54 and it applies here unchanged — as "revoke, then insert" two concurrent
+ * passwordReset.ts and it applies here unchanged — as "revoke, then insert" two concurrent
  * mints interleave, both stamping a set that does not yet contain the other's row and both
  * inserting, which produces exactly the state superseding exists to prevent. The resend route
  * answers 202 before doing its work, so "genuinely concurrent" is the ordinary case rather than an
@@ -173,7 +173,7 @@ export async function requestEmailVerification(
         userId: user.id,
         // The handle, not the display name: the greeting is built on it, and a display name is a
         // profile field the user can change to something a greeting should not have been built on.
-        // Same reasoning as `identity.user.registered` (users.ts:150-153).
+        // Same reasoning as `identity.user.registered` (users.ts).
         handle: user.handle,
         email: user.email,
         expiresAt: expiresAt.toISOString(),
@@ -220,7 +220,7 @@ async function mintVerificationToken(
  *
  * **The refusal is the UPDATE itself, not a check before one.** One conditional statement decides
  * whether this caller is the one that spends the token — `redeemPasswordResetToken`
- * (passwordReset.ts:103-110) is the pattern — so two redemptions racing on the same link cannot
+ * (passwordReset.ts) is the pattern — so two redemptions racing on the same link cannot
  * both win: the second matches no row because the first has already stamped `consumed_at`. A read
  * followed by a write would let both through, and both would mint a session.
  *
@@ -273,7 +273,7 @@ export const VERIFICATION_REQUIRED_STATUS =
 /**
  * The body of the 202 from `POST /auth/email/verify/resend`. **One string for both branches.**
  *
- * Shaped exactly like `RESET_REQUEST_STATUS` (passwordReset.ts:203) and for the same reason: a
+ * Shaped exactly like `RESET_REQUEST_STATUS` (passwordReset.ts) and for the same reason: a
  * different answer for a known and an unknown address — in status, body OR timing — is an
  * enumeration oracle. This route also has a second oracle the reset route does not: whether the
  * account is ALREADY verified. "That address is already confirmed" tells an unauthenticated caller
@@ -286,7 +286,7 @@ export const VERIFICATION_RESEND_STATUS =
  * Report what the delivery seam managed, for an operator reading the log.
  *
  * The user id is logged and **the address is not**, which is the same line `deliverPasswordReset`
- * draws (passwordReset.ts:216-220): Nimbus logged the email on every request, so a log search for
+ * draws (passwordReset.ts): Nimbus logged the email on every request, so a log search for
  * an address returned the fact that somebody had asked about it. The id joins to the row for an
  * operator and says nothing to anyone reading the log for other reasons. The token appears in
  * neither branch.

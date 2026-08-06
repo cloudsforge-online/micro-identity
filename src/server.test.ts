@@ -888,7 +888,7 @@ test('changing a password keeps the calling session and ends the others', { skip
  * the deferred trigger fires at the implicit commit of that one statement and raises 23514, so the
  * whole service suite went red the moment the guard landed. That failure is the guard working
  * rather than a harness problem — the statement it refused is character for character the one
- * `deploy/scripts/estate-bootstrap.sh:102` runs, which is the defect being closed.
+ * `deploy/scripts/estate-bootstrap.sh` runs, which is the defect being closed.
  */
 async function makeAdmin(): Promise<string> {
   const registered = await register()
@@ -1003,7 +1003,7 @@ test('a service token is refused where a user token is required', { skip }, asyn
  * A service token for admin-api holding `identity:admin`, minted the real way.
  *
  * Not a hand-built principal. `parseServiceGrants` refuses an unknown scope at import
- * (`env.ts:141`), so a token that comes out of this function is proof that `identity:admin` is in
+ * (`env.ts`), so a token that comes out of this function is proof that `identity:admin` is in
  * the contracts registry and that identity can actually mint it — which is the half a fake
  * principal cannot prove, and the half that was missing from thirty-nine scopes estate-wide.
  */

@@ -8,7 +8,7 @@
  * past. A guard proved only through `PUT /internal/users/:id/roles` would be a guard proved in the
  * one place it does not need to hold.
  *
- * The statement these tests are about is `deploy/scripts/estate-bootstrap.sh:102`:
+ * The statement these tests are about is `deploy/scripts/estate-bootstrap.sh`:
  *
  *     update users set roles = array['admin'] where email = '<the operator>';
  *
@@ -165,7 +165,7 @@ test('the one-shot cannot be re-armed: the grant table refuses DELETE and UPDATE
 /* ------------------------------------------------- an unapproved escalation is refused */
 
 test('THE MANUAL UPDATE, character for character, is refused', { skip }, async () => {
-  // deploy/scripts/estate-bootstrap.sh:102. Broken by dropping users_roles_need_a_grant: this
+  // deploy/scripts/estate-bootstrap.sh. Broken by dropping users_roles_need_a_grant: this
   // statement then succeeds and the assertion on `roles` below fails.
   const operator = await makeUser()
 

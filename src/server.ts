@@ -873,7 +873,7 @@ function buildRoutes(): Route[] {
           client: clientContext(ctx.req),
           // `pwd`, and this is the honest value THE TYPE ADMITS rather than the honest value full
           // stop. `AuthMethod` is `'pwd' | 'totp' | 'webauthn' | 'recovery_code' | 'sso'`
-          // (contracts-auth/src/index.ts:707) and what actually happened here is "proved control of
+          // (contracts-auth/src/index.ts) and what actually happened here is "proved control of
           // the mailbox" — a value that union does not carry. Widening a contract every service in
           // the estate verifies against, from inside one service, to record a nuance no policy
           // reads yet, is not a trade worth making. `pwd` is also true: the password was set
@@ -928,7 +928,7 @@ function buildRoutes(): Route[] {
       // Normalised through contracts-auth, never by hand: `findUserByIdentifier` matches the column
       // that holds exactly one spelling, and this file having its own idea of what lowercasing
       // means is how `Sam@example.com` becomes reachable by one route and not by another —
-      // users.ts:4-11 names that as the live defect this service exists to close.
+      // users.ts names that as the live defect this service exists to close.
       const user =
         identifier.length === 0
           ? null
@@ -959,7 +959,7 @@ function buildRoutes(): Route[] {
             // hangs `query` and `parameters` off its errors, and one of those parameters is the
             // event payload, which contains the link. `redactValue` reduces anything
             // `instanceof Error` to exactly `{ name, message, stack }` — every other property is
-            // dropped before a line is written (runtime/packages/telemetry/src/index.ts:95-101).
+            // dropped before a line is written (runtime/packages/telemetry/src/index.ts).
             ctx.log.error('verification resend threw', { err, userId: user.id })
           }
         },

@@ -97,7 +97,7 @@ export interface ProposedTopic {
 export const AWAITING_REGISTRATION: Readonly<Record<string, ProposedTopic>> = Object.freeze({
   // `identity.session.revoked` and `identity.mfa.added` were both described here because
   // micro-contracts was owned by another agent at the time. It has since adopted both —
-  // contracts/packages/events/src/index.ts:263 and :291 — so `isRegisteredTopic` now answers true
+  // contracts/packages/events/src/index.ts and :291 — so `isRegisteredTopic` now answers true
   // for each, and the test that asserts every entry is GENUINELY absent from the registry failed
   // until they were deleted. That is the third property in the doc above doing exactly what it
   // promised: the quarantine empties itself rather than rotting into a permanent allow-list.

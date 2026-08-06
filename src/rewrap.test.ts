@@ -158,7 +158,7 @@ async function enrolAndActivate(user: UserRow): Promise<{ factorId: string; appS
  * side of a step boundary.
  *
  * So the step is moved on deliberately and the guard's high-water mark rewound, exactly as
- * `mfa.test.ts:160-164` does. This neutralises the replay guard and NOTHING else: the code is still
+ * `mfa.test.ts` does. This neutralises the replay guard and NOTHING else: the code is still
  * computed from the authenticator's copy of the seed and still goes through the real
  * `authenticateMfa` path, so what the assertion tests is unchanged.
  */

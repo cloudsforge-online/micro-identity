@@ -55,7 +55,7 @@ export function isAllowedOrigin(
  * **An empty allowlist refuses every origin, and that is the intended production default.** The
  * membership test below is the only open-redirect guard in the estate's SSO — `hub-web` states
  * outright that it holds no second list, because a second list is a list that drifts
- * (`hub-web/src/lib/identity.ts:255-263`). "Empty means allow everything" is how an allowlist
+ * (`hub-web/src/lib/identity.ts`). "Empty means allow everything" is how an allowlist
  * becomes a redirector, so an unset variable must cost cross-surface sign-in rather than cost the
  * guard. What must NOT be empty is the deployment's value: see `.env.example`.
  */
