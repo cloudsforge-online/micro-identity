@@ -1,12 +1,14 @@
 {
   "name": "@cloudsforge/identity",
-  "version": "2.1.0",
+  "version": "2.1.1",
   "private": true,
   "description": "Accounts and authentication: users, profiles, credentials, MFA, sessions, devices, organisations, scoped service tokens and the RS256 signing key. Supersedes Nimbus.",
   "license": "MIT",
   "type": "module",
   "packageManager": "pnpm@11.9.0",
-  "engines": { "node": ">=22" },
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "start": "node --import tsx src/index.ts",
     "migrate": "node --import tsx src/migrator.ts",
