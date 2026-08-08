@@ -985,6 +985,58 @@ test('issuing a service token requires the admin role and leaves a row naming th
   assert.ok(rows[0]!.issued_by)
 })
 
+test('a mistyped service name is a bad request, not a fault', { skip }, async () => {
+  /*
+   * This route answered **500 `internal`** for this input. `createServiceCredential` refused with
+   * a bare `Error` — correctly, since a credential for a service with no grants could never mint
+   * a token — but a bare `Error` has no arm in the mapper, so it fell through to the last line.
+   * The operator was told identity was broken when the truth was that they had typed a name the
+   * estate does not configure, and those two readings lead to opposite next actions.
+   *
+   * `estate-bootstrap.sh` mints a credential per service by label, so this arrives in the middle
+   * of a deploy the first time a service is renamed upstream.
+   */
+  const admin = await makeAdmin()
+  const response = await call('POST', '/service-credentials', {
+    token: admin,
+    body: { service: 'not-a-service', label: 'x' },
+  })
+  assert.equal(response.status, 400)
+  const error = response.body['error'] as Record<string, unknown>
+  assert.equal(error['code'], 'unknown_service')
+  // The name back, so the answer is actionable in one read rather than after a grep.
+  assert.match(String(error['message']), /not-a-service/)
+
+  /*
+   * And NOT 403, which is what the neighbouring `UnknownServiceError` arm gives — deliberately.
+   * The predicate behind both is the same missing `IDENTITY_SERVICE_TOKEN_GRANTS` entry, but
+   * `POST /service-tokens` is asked to mint a token that ACTS AS a service and refuses an
+   * authorisation; this route is asked to create a credential FOR a service that does not exist.
+   * `deploy/scripts/estate-verify.sh:396` asserts the 403 on the other route against the live
+   * estate, so the two must not be collapsed into one status.
+   */
+  const acting = await call('POST', '/service-tokens', {
+    token: admin,
+    body: { service: 'not-a-service', scopes: ['ledger:read'] },
+  })
+  assert.equal(acting.status, 403)
+  assert.equal((acting.body['error'] as Record<string, unknown>)['code'], 'scope_not_granted')
+})
+
+test('a credential for a service the estate DOES configure is still created', { skip }, async () => {
+  // The negative above is only worth anything next to a positive: a route that refused every
+  // service would satisfy it, and would be a worse defect than the one being fixed.
+  const admin = await makeAdmin()
+  const created = await call('POST', '/service-credentials', {
+    token: admin,
+    body: { service: 'settlement', label: 'the negative half' },
+  })
+  assert.equal(created.status, 201)
+  assert.equal(created.body['service'], 'settlement')
+  // Returned exactly once, and only its digest is stored.
+  assert.match(String(created.body['secret']), /^cfsc_/)
+})
+
 test('a service token is refused where a user token is required', { skip }, async () => {
   const admin = await makeAdmin()
   const issued = await call('POST', '/service-tokens', {
