@@ -63,7 +63,13 @@ that ever signed is worth keeping so an old token in a log can be attributed
 
 ## Routes
 
-Read out of `src/server.ts`. `authenticate()` resolves the bearer token (`src/server.ts`);
+Read out of `src/server.ts`, and the table below is the whole of `buildRoutes()` rather than a
+selection from it. `grep -c "define('" src/server.ts` is how that claim is checked, and it is
+written as a command rather than as a number on purpose: the count in this file was wrong for as
+long as the machine-credential routes were missing from the table, and a number typed here goes
+stale the next time a route lands whereas a command does not.
+
+`authenticate()` resolves the bearer token (`src/server.ts`);
 `authenticateUser()` additionally refuses a **service** token, because a service token accepted where
 a user token was expected makes `sub` — a service name — look like a user id
 (`src/server.ts`); `authenticateAdmin()` additionally requires the `admin` role
@@ -108,6 +114,10 @@ is a conditional `UPDATE … RETURNING`, hand-off redemption is single-use by ro
 | `GET` | `/organisations/:id/memberships` | user | members of one organisation (`src/server.ts`) |
 | `POST` | `/organisations/:id/memberships` | user | invite, change or remove a member. Refuses anything that would leave the organisation with no accepted owner (`src/server.ts`) |
 | `POST` | `/service-tokens` | **admin** | mints a service token. **The token is returned once and never stored**, so there is nothing to read back (`src/server.ts`, note) |
+| `POST` | `/service-tokens/exchange` | **a service credential** — the `cfsc_…` secret in the `Authorization` header, never a token | trades the long-lived credential a container holds at rest for a fresh ten-minute service token. **This is the route that ends the ten-minute cliff.** `POST /service-tokens` above needs an operator, so before this existed a service could be *given* a token at deploy time and could never obtain a second one; ten minutes later every service-to-service call on the money tier failed with an expired credential, and no per-service suite could see it because a suite mints a token and uses it seconds later (`src/serviceCredentials.ts`). **It makes no `authenticate()` call and must not**: a `cfsc_…` string is not a JWT, and a route that accepted either would let a service token mint its own successor — an unexpiring credential assembled out of expiring parts (`src/server.ts`, reasoning). The prefix is checked before the database is touched, so a caller presenting a JWT here gets a 401 that *says* a credential was expected rather than one that reads as "wrong secret". **The service minted for is read off the credential row and never off the request — there is deliberately no `service` field to send**, because a caller that could name its own service would only have to hold any credential in the estate to mint for `settlement` (`src/serviceCredentials.ts`, reasoning). An empty body is the common case and yields the service's whole `IDENTITY_SERVICE_TOKEN_GRANTS` allowlist, which is what a provider wants at boot when it cannot yet know which of its call sites will be reached; `scopes` narrows and identity never widens, and anything outside the allowlist is **403 `scope_not_granted`**. `ttlSeconds` may only ever *shorten* — a caller asking for a day is clamped to 600s (`clampServiceTtl`, `src/tokens.ts`), because "just make the TTL longer" is the repair this was built instead of. An unrecognised credential and a revoked one are answered **identically, 401 `unauthenticated`**: telling a caller "that one exists but is revoked" confirms a valid secret to whoever stole it. Exchanging neither consumes nor rotates the credential, and that is the requirement rather than an omission — N replicas boot from the same credential and each needs its own token in its own process memory, so reuse detection here would read the second replica's start-up as a replay and burn the credential of a service that was doing nothing but starting (`src/serviceCredentials.ts`, reasoning) |
+| `POST` | `/service-credentials` | **admin** (a *user* token holding the role; `authenticateAdmin` refuses a service token outright) | mints the long-lived `cfsc_…` credential a service holds at rest — once per service per estate rather than once per ten minutes, which is the whole point. **The secret is in the response exactly once**: only its SHA-256 is stored, the same property that stops anyone with database access from minting for a service, and the reason re-provisioning is replace-and-revoke rather than "reuse the existing one" (`deploy/scripts/estate-bootstrap.sh` §5b does exactly that). Fail-closed on a service with no `IDENTITY_SERVICE_TOKEN_GRANTS` entry, because a credential that could never mint a single token would leave an operator holding a secret that silently does nothing — but that refusal is a bare `Error` and so surfaces as **500 `internal`** with a generic message, meaning a mistyped service name currently looks like a fault rather than a bad request (`src/serviceCredentials.ts`) |
+| `GET` | `/service-credentials` | **admin** | every credential with its service, label, creator, `createdAt`, `lastUsedAt` and `revokedAt`. **Never a secret, and there is none to return** — only the digest was ever stored. `lastUsedAt` is the operator-visible answer to "which services never adopted the token provider": a credential unused since a deploy is either a service that is down or one still sitting on the cliff, and both should be visible without reading logs (`src/serviceCredentials.ts`). `estate-bootstrap.sh` reads this list to find the previous run's credentials by label and revoke them before it mints the next set |
+| `POST` | `/service-credentials/:id/revoke` | **admin** | the containment lever a bearer JWT cannot have: a compromised service is offline within one token lifetime rather than one deploy cycle. Idempotent, and the **first** revocation's timestamp is the one kept, because re-revoking must not rewrite when containment actually began — the first thing an incident asks (`src/serviceCredentials.ts`, reasoning). **Tokens already minted under the credential stay valid until they expire**, which is the ten minutes doing its job and the reason that ceiling is worth defending. An id that names nothing is **404**, not a silent 200 |
 | `PUT` | `/internal/users/:id/roles` | **service token holding `identity:admin`** | sets a user's platform roles, writing a `platform_role_grants` row with `source = 'approval'` and the caller's `approvalId` in the same transaction. Refuses an operator's own token: a human who could promote directly would be one pair of eyes. See [The first administrator](#the-first-administrator) |
 | `GET` | `/internal/users/:id/role-grants` | **service token holding `identity:admin`** | the promotion trail for one user — who, when, on whose approval, and why |
 | `DELETE` | `/users/me` | user | requests deletion; the account moves to `pending_deletion`, which is a state you may still authenticate from (`src/server.ts`, reasoning) |
@@ -117,7 +127,7 @@ is a conditional `UPDATE … RETURNING`, hand-off redemption is single-use by ro
 | `POST` | `/admin/signing-keys/:kid/activate` | **admin** | starts it signing; refuses a key published for less than 20 minutes (`src/server.ts`) |
 | `POST` | `/admin/signing-keys/:kid/retire` | **admin** | removes it from the JWKS (`src/server.ts`) |
 
-### The fourteen routes that make no `authenticate()` call
+### The routes that make no `authenticate()` call
 
 `/livez`, `/readyz`, `/metrics`, `/.well-known/jwks.json`, `/auth/register`, `/auth/login`,
 `/auth/email/verify`, `/auth/email/verify/resend`, `/auth/mfa`, `/auth/refresh`, `/auth/logout`,
@@ -127,6 +137,14 @@ verification token, a hand-off code — which is why an `Authorization` header o
 rather than refused. (`/auth/email/verify/resend` carries none: it takes an identifier and answers
 the same 202 whatever it is given.) Note that `POST /auth/handoff` (mint) **does**
 authenticate; only `/redeem` does not.
+
+**And one that is easy to miss, because it is the only route in the file that reads the
+`Authorization` header itself: `POST /service-tokens/exchange`.** What it expects there is a service
+credential rather than a token, so `authenticate()` is not merely unnecessary but wrong —
+`verifyToken` would reject a `cfsc_…` string as malformed, and a route that accepted a token *or* a
+credential would let a service token mint its own successor. It is an authenticated route by any
+useful definition; it simply does not authenticate against the JWKS. This heading used to say
+"fourteen", and the exchange landing is what made that false — hence no number in it now.
 
 **A verifier that could not reach this service's own database answers 503, never 401**
 (`src/server.ts`, reasoning). Answering 401 there would have every client in the
