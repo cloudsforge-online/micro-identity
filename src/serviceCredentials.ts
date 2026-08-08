@@ -104,7 +104,7 @@ export class InvalidCredentialError extends Error {
  *
  *   * `POST /service-tokens` asks "mint me a token that ACTS AS `x`". A service with no grants may
  *     not act, so the refusal is an authorisation decision: **403**. That is not a preference —
- *     `deploy/scripts/estate-verify.sh:396` asserts exactly `403` for `service: "ledger"`, which
+ *     `deploy/scripts/estate-verify.sh` asserts exactly `403` for `service: "ledger"`, which
  *     makes no outbound call and therefore holds no grant, and it does so to make the grant
  *     derivation visible rather than leave it as an absence. Remapping the shared class would turn
  *     a live estate check red for a repair it has nothing to do with.

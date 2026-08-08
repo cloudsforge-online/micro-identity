@@ -1012,7 +1012,7 @@ test('a mistyped service name is a bad request, not a fault', { skip }, async ()
    * The predicate behind both is the same missing `IDENTITY_SERVICE_TOKEN_GRANTS` entry, but
    * `POST /service-tokens` is asked to mint a token that ACTS AS a service and refuses an
    * authorisation; this route is asked to create a credential FOR a service that does not exist.
-   * `deploy/scripts/estate-verify.sh:396` asserts the 403 on the other route against the live
+   * `deploy/scripts/estate-verify.sh` asserts the 403 on the other route against the live
    * estate, so the two must not be collapsed into one status.
    */
   const acting = await call('POST', '/service-tokens', {
