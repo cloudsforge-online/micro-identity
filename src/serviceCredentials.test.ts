@@ -34,6 +34,7 @@ import type postgres from 'postgres'
 import { SERVICE_TTL_SECONDS, verifyToken } from './tokens.ts'
 import {
   InvalidCredentialError,
+  UnconfiguredServiceError,
   createServiceCredential,
   exchangeServiceCredential,
   listServiceCredentials,
@@ -269,6 +270,46 @@ test('a credential for a service with no grants cannot be created at all', { ski
     createServiceCredential(db, { service: 'not-a-service', label: 'x', createdBy: null }),
     /no scopes are configured/,
   )
+})
+
+test('and the refusal is typed, so the route can answer 400 rather than 500', { skip }, async () => {
+  /*
+   * The refusal above was a bare `Error`. A bare `Error` has no arm in `src/server.ts`'s mapper,
+   * so it fell through to the last line — 500 `internal`, "the request could not be completed".
+   * An operator who mistyped a service name was told identity was faulty, and those two readings
+   * lead to opposite next actions: one waits and retries, the other fixes the name.
+   *
+   * `estate-bootstrap.sh` mints a credential per service by label, so this is not hypothetical:
+   * a service renamed upstream arrives here in the middle of a deploy.
+   *
+   * The class is asserted rather than only the message, because the message is what was already
+   * being matched above and it never distinguished the two — the type is the part the mapper
+   * branches on, and the part a rename cannot silently undo.
+   */
+  const err = await createServiceCredential(db, {
+    service: 'not-a-service',
+    label: 'x',
+    createdBy: null,
+  }).then(
+    () => null,
+    (e: unknown) => e,
+  )
+  assert.ok(err instanceof UnconfiguredServiceError, `threw ${String(err)}`)
+  // The name the caller actually typed, carried on the error rather than only inside a sentence,
+  // so anything mapping this has the value without parsing prose.
+  assert.equal(err.service, 'not-a-service')
+  assert.match(err.message, /not-a-service/)
+})
+
+test('a service that IS configured is not caught by that refusal', { skip }, async () => {
+  // The guard above is only worth anything if it can also let something through — a check that
+  // refuses everything is indistinguishable from a check that is wired to the wrong flag.
+  const ok = await createServiceCredential(db, {
+    service: SERVICE,
+    label: 'the negative half',
+    createdBy: null,
+  })
+  assert.equal(ok.service, SERVICE)
 })
 
 test('every machine issuance is in the ledger and names its credential', { skip }, async () => {

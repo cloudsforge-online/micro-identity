@@ -100,6 +100,7 @@ import {
 import {
   CREDENTIAL_PREFIX,
   InvalidCredentialError,
+  UnconfiguredServiceError,
   createServiceCredential,
   exchangeServiceCredential,
   listServiceCredentials,
@@ -546,6 +547,16 @@ async function handle(
     }
     if (err instanceof UnknownServiceError || err instanceof ScopeNotGrantedError) {
       return errorReply(403, 'scope_not_granted', err.message, ctx.requestId)
+    }
+    if (err instanceof UnconfiguredServiceError) {
+      // 400 and not the 403 directly above, even though the predicate behind both is the same
+      // missing `IDENTITY_SERVICE_TOKEN_GRANTS` entry. `POST /service-tokens` is asked to mint a
+      // token that ACTS AS a service, and a service with no grants may not act — an authorisation
+      // decision. `POST /service-credentials` is asked to create a credential FOR a service that
+      // does not exist; nobody is being refused anything. It reached here as a bare `Error` and
+      // therefore as 500 `internal`, which tells an operator identity is faulty when the truth is
+      // that they typed a name this estate does not know. See `UnconfiguredServiceError`.
+      return errorReply(400, 'unknown_service', err.message, ctx.requestId)
     }
     if (err instanceof UnknownScopeError) {
       return errorReply(400, 'unknown_scope', err.message, ctx.requestId)

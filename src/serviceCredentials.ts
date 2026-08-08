@@ -93,6 +93,46 @@ export class InvalidCredentialError extends Error {
 }
 
 /**
+ * A credential was asked for on behalf of a service the estate does not configure.
+ *
+ * ── WHY THIS IS A SEPARATE CLASS FROM `UnknownServiceError`, AND NOT A RENAME ──────────────────
+ *
+ * `serviceTokens.ts` already has `UnknownServiceError` for the same PREDICATE — no entry in
+ * `IDENTITY_SERVICE_TOKEN_GRANTS` — and the obvious tidy is to reuse it here. It is the wrong
+ * move, because the two routes are answering different questions and the status code is the
+ * answer:
+ *
+ *   * `POST /service-tokens` asks "mint me a token that ACTS AS `x`". A service with no grants may
+ *     not act, so the refusal is an authorisation decision: **403**. That is not a preference —
+ *     `deploy/scripts/estate-verify.sh:396` asserts exactly `403` for `service: "ledger"`, which
+ *     makes no outbound call and therefore holds no grant, and it does so to make the grant
+ *     derivation visible rather than leave it as an absence. Remapping the shared class would turn
+ *     a live estate check red for a repair it has nothing to do with.
+ *   * `POST /service-credentials` asks "create a credential FOR `x`". There is no `x`. Nobody is
+ *     being refused anything, because there is nothing to refuse — the request names something
+ *     that does not exist: **400**.
+ *
+ * The condition that produced this class was **500 `internal`**, from a bare `Error` with no arm
+ * in the mapper (`src/server.ts`). That is the part that was actually wrong. 500 tells an operator
+ * "identity is broken, retry later" when the truth is "you typed a service name this estate does
+ * not know", and the two lead to opposite next actions. `estate-bootstrap.sh` mints credentials by
+ * label for every service in the estate, so a service renamed upstream lands here — and it landed
+ * as an unexplained fault in the middle of a deploy.
+ *
+ * The refusal itself is correct and stays: a credential for a service with no grants could never
+ * mint a single token, so creating one leaves an operator holding a secret that silently does
+ * nothing, and it fails at the worst possible moment instead of at creation.
+ */
+export class UnconfiguredServiceError extends Error {
+  readonly service: string
+  constructor(service: string) {
+    super(`no scopes are configured for service '${service}'`)
+    this.name = 'UnconfiguredServiceError'
+    this.service = service
+  }
+}
+
+/**
  * Digest a presented credential.
  *
  * SHA-256 and NOT scrypt, which is the opposite of `passwords.ts` and deliberate. The secret is 32
@@ -118,13 +158,17 @@ export interface NewServiceCredential {
  * Fail-closed on an unknown service: a credential for something with no entry in
  * `IDENTITY_SERVICE_TOKEN_GRANTS` could never mint a single token, so creating one would leave an
  * operator holding a secret that silently does nothing. Refusing at creation says so immediately.
+ *
+ * The refusal is {@link UnconfiguredServiceError} and not a bare `Error`, which is what it was:
+ * a bare one has no arm in the route's mapper and fell through to 500 `internal`, so a mistyped
+ * service name presented as a fault in identity rather than as a bad request. See that class.
  */
 export async function createServiceCredential(
   sql: Db,
   input: { service: string; label: string; createdBy: string | null },
 ): Promise<NewServiceCredential> {
   if (!env.serviceTokenGrants[input.service]) {
-    throw new Error(`no scopes are configured for service '${input.service}'`)
+    throw new UnconfiguredServiceError(input.service)
   }
   // 32 bytes. base64url rather than hex so the string is shorter to handle without being any weaker.
   const secret = CREDENTIAL_PREFIX + randomBytes(32).toString('base64url')
