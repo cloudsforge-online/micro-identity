@@ -1,6 +1,6 @@
 {
   "name": "@cloudsforge/identity",
-  "version": "2.5.8",
+  "version": "2.5.9",
   "private": true,
   "description": "Accounts and authentication: users, profiles, credentials, MFA, sessions, devices, organisations, scoped service tokens and the RS256 signing key. Supersedes Nimbus.",
   "license": "MIT",
