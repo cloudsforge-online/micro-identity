@@ -123,6 +123,11 @@ const server = createServer({
   metrics,
   sql: sql as unknown as Db,
   deletionGraceDays: env.deletionGraceDays,
+  // `null` on any deployment without a Turnstile account, which is every developer machine and
+  // every micro network — `parseTurnstile` refuses the half-configured middle, so this is either
+  // the whole feature or none of it. `turnstileFetch` is left unset: the global `fetch` is the
+  // right one everywhere except the suite, which injects its own.
+  turnstile: env.turnstile,
   // Queue depth is sampled at scrape time rather than on a timer. There is no `setInterval` in this
   // repository, and CI greps for one — rule 8.
   beforeScrape: async () => {
