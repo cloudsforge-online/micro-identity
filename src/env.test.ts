@@ -421,3 +421,122 @@ test('no error message can quote a secret', () => {
     }
   }
 })
+
+/* -------------------------------------------------------------------- the registration challenge */
+
+/**
+ * A plausible Turnstile secret. Vendor-shaped, and generated so no literal is left to copy.
+ *
+ * Cloudflare issues secrets as `0x` followed by a mixed-alphabet tail. `assertOpaqueSecret` is the
+ * class that accepts that — `assertGeneratedSecret` would refuse it on the alphabet check, which is
+ * the whole reason `parseTurnstile` does not use the strict rule.
+ */
+function turnstileSecret(): string {
+  return `0x4AAAAAAA${randomBytes(18).toString('base64url')}`
+}
+
+const SITE_KEY = '0x4AAAAAAEMXmH8jdtxq8FYo'
+
+test('with neither Turnstile variable set the feature is simply absent', () => {
+  // The state every developer machine, every CI run and every micro network is in. It must not be
+  // an error, and it must not be a half-enabled gate.
+  assert.equal(loadEnv(COMPLETE).turnstile, null)
+})
+
+test('a Turnstile secret without a site key refuses to boot, and so does the reverse', () => {
+  // Both halves are silent failures in production: a secret with no site key refuses every
+  // registration (no browser can produce a token), a site key with no secret accepts every one.
+  assert.throws(
+    () => loadEnv({ ...COMPLETE, TURNSTILE_SECRET: turnstileSecret(), TURNSTILE_HOSTNAMES: 'hub.example.test' }),
+    /TURNSTILE_SITE_KEY/,
+  )
+  assert.throws(
+    () => loadEnv({ ...COMPLETE, TURNSTILE_SITE_KEY: SITE_KEY, TURNSTILE_HOSTNAMES: 'hub.example.test' }),
+    /TURNSTILE_SECRET/,
+  )
+})
+
+test('an enabled challenge with an empty hostname allowlist refuses to boot', () => {
+  // `IDENTITY_HANDOFF_ORIGINS` shipped empty on the estate and turned `POST /auth/handoff` into a
+  // 403 for every caller. `hostnames.includes()` over an empty array is that defect verbatim, so
+  // the empty case dies at boot where somebody can see it.
+  const half = { ...COMPLETE, TURNSTILE_SECRET: turnstileSecret(), TURNSTILE_SITE_KEY: SITE_KEY }
+  assert.throws(() => loadEnv(half), /TURNSTILE_HOSTNAMES/)
+  assert.throws(() => loadEnv({ ...half, TURNSTILE_HOSTNAMES: '  ,  ' }), /TURNSTILE_HOSTNAMES/)
+})
+
+test('the hostname allowlist takes bare hostnames, lowercased and de-duplicated', () => {
+  const source = {
+    ...COMPLETE,
+    TURNSTILE_SECRET: turnstileSecret(),
+    TURNSTILE_SITE_KEY: SITE_KEY,
+    TURNSTILE_HOSTNAMES: ' Hub.CloudsForge.online , hub.cloudsforge.online ,localhost ',
+  }
+  assert.deepEqual(loadEnv(source).turnstile?.hostnames, ['hub.cloudsforge.online', 'localhost'])
+
+  // An origin, a port or a path would never match `siteverify`'s bare `hostname` field, so it would
+  // present as "the widget renders and registration always fails" — a boot failure instead.
+  for (const bad of ['https://hub.cloudsforge.online', 'hub.cloudsforge.online:443', 'hub.cloudsforge.online/x']) {
+    assert.throws(() => loadEnv({ ...source, TURNSTILE_HOSTNAMES: bad }), /TURNSTILE_HOSTNAMES/, bad)
+  }
+})
+
+test('a placeholder Turnstile secret refuses to boot, and the message never quotes it', () => {
+  const base = { ...COMPLETE, TURNSTILE_SITE_KEY: SITE_KEY, TURNSTILE_HOSTNAMES: 'hub.example.test' }
+  for (const value of ['changeme', 'x', 'CHANGE_ME_CHANGE_ME_CHANGE']) {
+    try {
+      loadEnv({ ...base, TURNSTILE_SECRET: value })
+      assert.fail(`TURNSTILE_SECRET should have thrown on ${value}`)
+    } catch (err) {
+      assert.ok(err instanceof EnvError, value)
+      assert.ok(!err.message.includes(value), 'the message echoed the rejected secret')
+      assert.ok(err.message.includes('TURNSTILE_SECRET'), 'the message did not name the variable')
+    }
+  }
+})
+
+test('the secret and the site key may not be the same value', () => {
+  // The paste that swaps them is otherwise undetectable — the widget would render under the secret
+  // and the secret would be published to every browser.
+  const secret = turnstileSecret()
+  assert.throws(
+    () =>
+      loadEnv({
+        ...COMPLETE,
+        TURNSTILE_SECRET: secret,
+        TURNSTILE_SITE_KEY: secret,
+        TURNSTILE_HOSTNAMES: 'hub.example.test',
+      }),
+    (err: unknown) => err instanceof EnvError && !err.message.includes(secret),
+  )
+})
+
+test('a complete Turnstile configuration loads', () => {
+  const secret = turnstileSecret()
+  const turnstile = loadEnv({
+    ...COMPLETE,
+    TURNSTILE_SECRET: secret,
+    TURNSTILE_SITE_KEY: SITE_KEY,
+    TURNSTILE_HOSTNAMES: 'hub.cloudsforge.online',
+  }).turnstile
+  assert.equal(turnstile?.secret, secret)
+  assert.equal(turnstile?.siteKey, SITE_KEY)
+  assert.deepEqual(turnstile?.hostnames, ['hub.cloudsforge.online'])
+})
+
+test('.env.example documents the three Turnstile variables without enabling them', () => {
+  // Rule 9 — "a repo declares the variables it needs" — with one wrinkle: this feature is OFF by
+  // default, so declaring it as a live assignment would ship an example that refuses to boot. The
+  // names must still be findable by somebody deploying it, so they are commented, and this is what
+  // stops the comments being deleted as decoration.
+  const text = readFileSync(new URL('../.env.example', import.meta.url), 'utf8')
+  for (const name of ['TURNSTILE_SECRET', 'TURNSTILE_SITE_KEY', 'TURNSTILE_HOSTNAMES']) {
+    assert.ok(text.includes(name), `.env.example does not mention ${name}`)
+  }
+  // And the file still loads, with the challenge absent — the commented lines must not become
+  // assignments by accident.
+  const source = readEnvExample()
+  source['IDENTITY_KEY_SECRET'] = COMPLETE['IDENTITY_KEY_SECRET']!
+  source['OUTBOX_SIGNING_SECRET'] = COMPLETE['OUTBOX_SIGNING_SECRET']!
+  assert.equal(loadEnv(source).turnstile, null)
+})

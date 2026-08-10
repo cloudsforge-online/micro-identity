@@ -40,6 +40,49 @@ let db: Db
 let server: Server
 let origin: string
 
+/* ------------------------------------------------------- the second server: Turnstile enabled */
+
+/**
+ * A SECOND server, identical to the first except that it has a registration challenge.
+ *
+ * Two servers rather than one mutable dependency, because "the route is exactly what it was when
+ * Turnstile is not configured" is one of the properties under test and it is only worth anything if
+ * something is actually running in that state. `server` above is that deployment — every other test
+ * in this file drives it, and if the gate leaked into the unconfigured path they would all go red.
+ *
+ * Both share one database, so a service token minted through `server` verifies at `challenged`.
+ */
+let challenged: Server
+let challengedOrigin: string
+
+const CHALLENGE_HOSTNAME = 'hub.challenge.test'
+
+/**
+ * What Cloudflare answers next, and what it was asked.
+ *
+ * A `let` a test assigns rather than a fixed double: a fake that can only say `success: true`
+ * proves nothing at all (micro-org#355, #356), so every case below has to be able to make
+ * siteverify refuse, hang up, or answer something unreadable.
+ */
+/**
+ * `Response` in this file is the local JSON-shaped interface a few lines up, so the real one has to
+ * be named through `fetch`'s own return type rather than shadowed.
+ */
+type HttpResponse = Awaited<ReturnType<typeof fetch>>
+
+let siteverify: (body: URLSearchParams) => HttpResponse = () => new Response('{}', { status: 200 })
+let siteverifyCalls: URLSearchParams[] = []
+
+const TURNSTILE_SECRET_FIXTURE = `0x4AAAAAAA${randomUUID().replaceAll('-', '')}`
+
+function answers(payload: unknown): void {
+  siteverify = () =>
+    new Response(JSON.stringify(payload), {
+      status: 200,
+      headers: { 'content-type': 'application/json' },
+    })
+}
+
 before(async () => {
   if (!enabled) return
   sql = openDb(16)
@@ -56,14 +99,42 @@ before(async () => {
     metrics: registerServiceMetrics(registerJobMetrics(registerHttpMetrics(new Metrics()))),
     sql: db,
     deletionGraceDays: 0,
+    // NOT configured, which is the state every developer machine and every micro network is in.
+    // Every other test in this file runs against it, so a gate that leaked into this path would
+    // take the whole file down rather than hide.
+    turnstile: null,
   })
   await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()))
   origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`
+
+  const challengedLifecycle = new Lifecycle({ drainDelayMs: 0, drainTimeoutMs: 1_000 })
+  challengedLifecycle.markReady()
+  challenged = createServer({
+    lifecycle: challengedLifecycle,
+    logger: new Logger({ service: 'identity-test-challenged', level: 'error', sink: () => {} }),
+    metrics: registerServiceMetrics(registerJobMetrics(registerHttpMetrics(new Metrics()))),
+    sql: db,
+    deletionGraceDays: 0,
+    turnstile: {
+      secret: TURNSTILE_SECRET_FIXTURE,
+      siteKey: '0x4AAAAAAEMXmH8jdtxq8FYo',
+      hostnames: [CHALLENGE_HOSTNAME],
+    },
+    // No network. The suite IS Cloudflare here, and it can refuse.
+    turnstileFetch: async (_url, init) => {
+      const body = new URLSearchParams(String(init.body))
+      siteverifyCalls.push(body)
+      return siteverify(body)
+    },
+  })
+  await new Promise<void>((resolve) => challenged.listen(0, '127.0.0.1', () => resolve()))
+  challengedOrigin = `http://127.0.0.1:${(challenged.address() as AddressInfo).port}`
 })
 
 after(async () => {
   if (!enabled) return
   await new Promise<void>((resolve) => server.close(() => resolve()))
+  await new Promise<void>((resolve) => challenged.close(() => resolve()))
   await sql.end({ timeout: 5 })
 })
 
@@ -94,9 +165,9 @@ function nextClientAddress(): string {
 async function call(
   method: string,
   path: string,
-  options: { body?: unknown; token?: string; headers?: Record<string, string> } = {},
+  options: { body?: unknown; token?: string; headers?: Record<string, string>; at?: string } = {},
 ): Promise<Response> {
-  const response = await fetch(`${origin}${path}`, {
+  const response = await fetch(`${options.at ?? origin}${path}`, {
     method,
     headers: {
       'content-type': 'application/json',
@@ -1470,4 +1541,321 @@ test('identity serves no product surface', { skip }, async () => {
   }
   const response = await call('GET', '/auth/me', { headers: { accept: 'text/html' } })
   assert.match(response.headers.get('content-type') ?? '', /application\/json/)
+})
+
+/* ------------------------------------------------------- the registration challenge (micro-org#361) */
+
+/**
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ * These run against `challenged`, the second server, which has a Turnstile configuration and a
+ * `siteverify` the test controls. The fake CAN REFUSE — a captcha double that only ever answers
+ * `success: true` proves nothing, and the estate has shipped that defect twice already
+ * (micro-org#355, #356).
+ *
+ * `server`, which every other test in this file drives, has `turnstile: null`. That is not a gap:
+ * "a deployment with no Turnstile account registers people exactly as it did before" is a property
+ * of this feature, and roughly a hundred tests above are its proof.
+ * ══════════════════════════════════════════════════════════════════════════════════════════════
+ */
+
+/** Everything a solved widget on our own sign-up page would produce. */
+const SOLVED = { success: true, action: 'signup', hostname: CHALLENGE_HOSTNAME }
+
+/** A registration body with a token in it. The token is opaque; only the fake reads it. */
+function registration(token?: string): Record<string, unknown> {
+  return {
+    email: freshEmail(),
+    handle: freshHandle(),
+    password: GOOD_PASSWORD,
+    ...(token === undefined ? {} : { 'cf-turnstile-response': token }),
+  }
+}
+
+async function challengeCount(outcome: string): Promise<number> {
+  const text = await (await fetch(`${challengedOrigin}/metrics`)).text()
+  const line = text
+    .split('\n')
+    .find((l) => l.startsWith(`identity_registration_challenge_total{outcome="${outcome}"}`))
+  return line ? Number(line.slice(line.lastIndexOf(' ') + 1)) : 0
+}
+
+async function accountsWithEmail(email: string): Promise<number> {
+  const rows = await sql<{ n: string }[]>`select count(*)::text as n from users where email = lower(${email})`
+  return Number(rows[0]!.n)
+}
+
+beforeEach(() => {
+  siteverifyCalls = []
+  answers(SOLVED)
+})
+
+test('GET /auth/challenge publishes the site key at RUNTIME, and needs no credential', { skip }, async () => {
+  // hub-web compiles NO configuration — `src/lib/hosts.ts` derives every address from
+  // `window.location` so one image serves localhost, micro and mainnet. A site key baked into the
+  // bundle would be the first thing to break that. It is asked by somebody who has no account yet,
+  // so it takes no token.
+  const response = await call('GET', '/auth/challenge', { at: challengedOrigin })
+  assert.equal(response.status, 200, JSON.stringify(response.body))
+  assert.equal(response.body['required'], true)
+  assert.equal(response.body['provider'], 'turnstile')
+  assert.equal(response.body['siteKey'], '0x4AAAAAAEMXmH8jdtxq8FYo')
+  assert.equal(response.body['action'], 'signup')
+  // The SITE key, which is public. Never the secret.
+  assert.ok(!JSON.stringify(response.body).includes(TURNSTILE_SECRET_FIXTURE), 'the secret was published')
+})
+
+test('an unconfigured deployment answers required:false and registers exactly as before', { skip }, async () => {
+  const response = await call('GET', '/auth/challenge')
+  assert.equal(response.status, 200)
+  assert.equal(response.body['required'], false)
+  assert.equal(response.body['siteKey'], null, 'null rather than absent, so a client can tell them apart')
+
+  // And the route itself is untouched: no token, no bearer, 202 and an account.
+  const body = registration()
+  const registered = await call('POST', '/auth/register', { body })
+  assert.equal(registered.status, 202, JSON.stringify(registered.body))
+  assert.equal(await accountsWithEmail(body['email'] as string), 1)
+})
+
+test('a solved challenge registers, and the token reaches siteverify with the secret', { skip }, async () => {
+  const body = registration('a-solved-token')
+  const before = await challengeCount('ok')
+  const response = await call('POST', '/auth/register', { body, at: challengedOrigin })
+  assert.equal(response.status, 202, JSON.stringify(response.body))
+  assert.equal(await accountsWithEmail(body['email'] as string), 1)
+
+  assert.equal(siteverifyCalls.length, 1, 'the token was verified server-side exactly once')
+  assert.equal(siteverifyCalls[0]?.get('response'), 'a-solved-token')
+  assert.equal(siteverifyCalls[0]?.get('secret'), TURNSTILE_SECRET_FIXTURE)
+  assert.equal(await challengeCount('ok'), before + 1)
+})
+
+test('a registration with NO token is refused, creates nothing, and is a distinct code', { skip }, async () => {
+  const body = registration()
+  const before = await challengeCount('missing_token')
+  const response = await call('POST', '/auth/register', { body, at: challengedOrigin })
+
+  assert.equal(response.status, 403)
+  assert.equal((response.body['error'] as Record<string, unknown>)['code'], 'challenge_required')
+  assert.equal(siteverifyCalls.length, 0, 'nothing was asked of Cloudflare')
+  assert.equal(await accountsWithEmail(body['email'] as string), 0, 'no account was created')
+  assert.equal(await challengeCount('missing_token'), before + 1)
+})
+
+test('a token Cloudflare rejects is refused as challenge_failed, and no account appears', { skip }, async () => {
+  // The case the whole feature exists for. `timeout-or-duplicate` is what a REPLAYED token earns:
+  // Cloudflare redeems a token at siteverify, so it is single-use.
+  answers({ success: false, 'error-codes': ['timeout-or-duplicate'] })
+  const body = registration('a-spent-token')
+  const before = await challengeCount('rejected')
+  const response = await call('POST', '/auth/register', { body, at: challengedOrigin })
+
+  assert.equal(response.status, 403)
+  assert.equal((response.body['error'] as Record<string, unknown>)['code'], 'challenge_failed')
+  assert.equal(await accountsWithEmail(body['email'] as string), 0)
+  assert.equal(await challengeCount('rejected'), before + 1)
+})
+
+test('a token solved for another action, or on another site, is refused', { skip }, async () => {
+  // Both are `success: true` at Cloudflare. The sitekey is public, so a widget on somebody else's
+  // page mints tokens that are genuinely solved — the action and the hostname are the only things
+  // that say WHICH form and WHOSE page.
+  for (const payload of [
+    { ...SOLVED, action: 'login' },
+    { ...SOLVED, hostname: 'evil.example' },
+    { ...SOLVED, hostname: `${CHALLENGE_HOSTNAME}.evil.example` },
+  ]) {
+    answers(payload)
+    const body = registration('a-genuinely-solved-token')
+    const response = await call('POST', '/auth/register', { body, at: challengedOrigin })
+    assert.equal(response.status, 403, JSON.stringify(payload))
+    assert.equal(
+      (response.body['error'] as Record<string, unknown>)['code'],
+      'challenge_failed',
+      JSON.stringify(payload),
+    )
+    assert.equal(await accountsWithEmail(body['email'] as string), 0, JSON.stringify(payload))
+  }
+})
+
+test('a Turnstile outage FAILS CLOSED, as 503 and not as a silent pass', { skip }, async () => {
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  // THIS IS THE ASSERTION THAT ENCODES THE ARGUMENT, AND micro-org#361 ARGUES THE OTHER WAY.
+  //
+  // The issue recommends fail-OPEN for registration — "a captcha vendor's outage should not stop a
+  // real person from opening an account". Overridden on the measurement in the same issue: this
+  // estate has NO organic registrations to lose, so fail-open's beneficiaries are today an empty
+  // set while the population it admits is exactly the one the gate exists to stop. The day that
+  // stops being true, THIS TEST is the thing to change, deliberately, rather than the code
+  // quietly. See the header of turnstile.ts.
+  //
+  // 503 rather than 403 because nothing about the caller was wrong and a client should retry; an
+  // operator who cannot tell "a bot was stopped" from "Cloudflare was unreachable" can act on
+  // neither.
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  const outages: (() => HttpResponse)[] = [
+    () => {
+      throw Object.assign(new Error('aborted'), { name: 'TimeoutError' })
+    },
+    () => new Response('bad gateway', { status: 502 }),
+    () => new Response('<html>maintenance</html>', { status: 200 }),
+  ]
+  const before = await challengeCount('upstream_failure')
+  for (const outage of outages) {
+    siteverify = outage
+    const body = registration('a-token-nobody-can-check')
+    const response = await call('POST', '/auth/register', { body, at: challengedOrigin })
+    assert.equal(response.status, 503, JSON.stringify(response.body))
+    assert.equal((response.body['error'] as Record<string, unknown>)['code'], 'challenge_unavailable')
+    assert.equal(await accountsWithEmail(body['email'] as string), 0, 'an outage created an account')
+  }
+  assert.equal(await challengeCount('upstream_failure'), before + outages.length)
+})
+
+test('a SERVICE PRINCIPAL registers with no token at all, and nothing else does', { skip }, async () => {
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  // THE BYPASS IS THE PRINCIPAL, NOT A HEADER. `beacon` registers synthetic accounts every few
+  // minutes and cannot solve a captcha; the shortcut would be a header it sets or a shared string
+  // in its environment, and either is a credential that never expires, cannot be revoked without a
+  // redeploy, and is forgeable by anyone who can send bytes.
+  //
+  // A service token has none of those properties: 600 seconds, signed by this service, revocable
+  // by deleting the credential.
+  // ══════════════════════════════════════════════════════════════════════════════════════════════
+  const admin = await makeAdmin()
+  const minted = await call('POST', '/service-tokens', {
+    token: admin,
+    body: { service: 'settlement', scopes: ['ledger:read'] },
+  })
+  assert.equal(minted.status, 201, JSON.stringify(minted.body))
+  const serviceToken = minted.body['token'] as string
+
+  const body = registration()
+  const response = await call('POST', '/auth/register', {
+    body,
+    token: serviceToken,
+    at: challengedOrigin,
+  })
+  assert.equal(response.status, 202, JSON.stringify(response.body))
+  assert.equal(await accountsWithEmail(body['email'] as string), 1)
+  assert.equal(siteverifyCalls.length, 0, 'a service principal was sent to Cloudflare anyway')
+})
+
+test('a USER token is not a bypass, and neither is a garbage bearer', { skip }, async () => {
+  // A leaked access token must not become a registration cannon, and a browser extension injecting
+  // a stale bearer must not be able to stop a person opening an account — so an unusable bearer
+  // falls THROUGH to the challenge rather than becoming a 401 on a public sign-up route.
+  const user = await register()
+  for (const token of [user.accessToken, 'not-a-token', 'a.b.c']) {
+    const body = registration()
+    const refused = await call('POST', '/auth/register', { body, token, at: challengedOrigin })
+    assert.equal(refused.status, 403, `${token.slice(0, 6)} bypassed the challenge`)
+    assert.equal(
+      (refused.body['error'] as Record<string, unknown>)['code'],
+      'challenge_required',
+      'it should have fallen through to the challenge, not 401',
+    )
+    assert.equal(await accountsWithEmail(body['email'] as string), 0)
+
+    // …and the same principal WITH a solved token gets through, so the refusal above is the
+    // challenge and not the bearer.
+    const withToken = registration('a-solved-token')
+    const allowed = await call('POST', '/auth/register', { body: withToken, token, at: challengedOrigin })
+    assert.equal(allowed.status, 202, JSON.stringify(allowed.body))
+  }
+})
+
+test('the challenge is taken BEFORE anything is created, so it is not an existence oracle', { skip }, async () => {
+  // A caller who cannot pass the gate must not be able to use the route to learn which addresses
+  // and handles are taken: `registerUser`'s 409 is an existence oracle and a field-level 400 is a
+  // weaker one. So an unchallenged request that is ALSO a duplicate answers the challenge refusal.
+  const existing = registration('a-solved-token')
+  assert.equal((await call('POST', '/auth/register', { body: existing, at: challengedOrigin })).status, 202)
+
+  answers({ success: false, 'error-codes': ['invalid-input-response'] })
+  const duplicate = await call('POST', '/auth/register', {
+    body: { ...existing, 'cf-turnstile-response': 'a-bad-token' },
+    at: challengedOrigin,
+  })
+  assert.equal(duplicate.status, 403, 'a duplicate leaked through the gate as a 409')
+  assert.equal((duplicate.body['error'] as Record<string, unknown>)['code'], 'challenge_failed')
+
+  // The same with a body that is not a valid registration at all: still the challenge, still not a
+  // 400 naming the field. The CODE is asserted, not just the status — `that registration is not
+  // valid` is a 400, so a route that validated first would be caught by the status, but a route
+  // that validated first and happened to answer 403 for some other reason would not.
+  const malformed = await call('POST', '/auth/register', {
+    body: { email: 'not-an-address', handle: '!', password: 'x', 'cf-turnstile-response': 'a-bad-token' },
+    at: challengedOrigin,
+  })
+  assert.equal(malformed.status, 403, 'a malformed unchallenged registration was validated first')
+  assert.equal(
+    (malformed.body['error'] as Record<string, unknown>)['code'],
+    'challenge_failed',
+    'the answer names the FIELD that is wrong, which tells an unchallenged caller what this ' +
+      'service thinks of a body it should not have read at all',
+  )
+
+  // And with no token at all, which is the shape a scripted caller actually sends.
+  const unchallenged = await call('POST', '/auth/register', {
+    body: { email: 'not-an-address', handle: '!', password: 'x' },
+    at: challengedOrigin,
+  })
+  assert.equal(unchallenged.status, 403)
+  assert.equal(
+    (unchallenged.body['error'] as Record<string, unknown>)['code'],
+    'challenge_required',
+    'a caller with no token learned that this body is malformed',
+  )
+  assert.deepEqual(unchallenged.body['fields'], undefined, 'a field-level 400 leaked through the gate')
+})
+
+test('an over-long token is refused without asking Cloudflare', { skip }, async () => {
+  // An unauthenticated caller who can make this service post 64KB to a third party has an
+  // amplifier. `MAX_BODY_BYTES` is 64KB, and Turnstile's own ceiling is 2048.
+  const body = registration('a'.repeat(4096))
+  const response = await call('POST', '/auth/register', { body, at: challengedOrigin })
+  assert.equal(response.status, 403)
+  assert.equal((response.body['error'] as Record<string, unknown>)['code'], 'challenge_required')
+  assert.equal(siteverifyCalls.length, 0)
+})
+
+test('no refusal, and no metric label, ever contains the token or the secret', { skip }, async () => {
+  answers({ success: false, 'error-codes': ['invalid-input-response'] })
+  const token = 'a-token-that-must-not-be-echoed'
+  const response = await call('POST', '/auth/register', {
+    body: registration(token),
+    at: challengedOrigin,
+  })
+  const rendered = JSON.stringify(response.body)
+  assert.ok(!rendered.includes(token), `the refusal echoed the token: ${rendered}`)
+  assert.ok(!rendered.includes(TURNSTILE_SECRET_FIXTURE), 'the refusal echoed the secret')
+
+  const metrics = await (await fetch(`${challengedOrigin}/metrics`)).text()
+  assert.ok(!metrics.includes(token), 'the metric carried the token as a label')
+  assert.ok(!metrics.includes(TURNSTILE_SECRET_FIXTURE), 'the metric carried the secret as a label')
+  // The label set stays the four documented outcomes — an unbounded label is a cardinality bomb on
+  // a route an unauthenticated caller controls.
+  for (const line of metrics.split('\n')) {
+    if (!line.startsWith('identity_registration_challenge_total{')) continue
+    assert.match(line, /outcome="(ok|missing_token|rejected|upstream_failure)"/, line)
+  }
+})
+
+test('the rate limit still stands in front of the challenge', { skip }, async () => {
+  // The gate is an ADDITION to the limiter, not a replacement for it — and the limiter is taken at
+  // dispatch, so a challenge refusal costs a caller exactly what a success does. Otherwise an
+  // attacker gets unlimited free attempts by simply failing them.
+  const from = { 'x-forwarded-for': '203.0.113.90' }
+  answers({ success: false, 'error-codes': ['invalid-input-response'] })
+  const seen: number[] = []
+  for (let i = 0; i < 8; i += 1) {
+    const response = await call('POST', '/auth/register', {
+      body: registration('a-bad-token'),
+      headers: from,
+      at: challengedOrigin,
+    })
+    seen.push(response.status)
+  }
+  assert.ok(seen.includes(429), `refusals were free: ${seen.join(',')}`)
 })

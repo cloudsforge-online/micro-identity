@@ -19,7 +19,8 @@
 
 import { hostname } from 'node:os'
 import { SCOPE_NAMES, isScope, type Scope } from '@cloudsforge/contracts-auth'
-import { SecretError, assertGeneratedSecret } from '@cloudsforge/secrets'
+import { SecretError, assertGeneratedSecret, assertOpaqueSecret } from '@cloudsforge/secrets'
+import type { TurnstileConfig } from './turnstile.ts'
 
 /**
  * The service's own name. A constant rather than a variable: it is a property of the repository,
@@ -274,6 +275,79 @@ export function parseServiceGrants(raw: string): Readonly<Record<string, readonl
   return Object.freeze(out)
 }
 
+/**
+ * The registration challenge — all three variables, or none of them (micro-org#361).
+ *
+ * **THIS IS THE FIRST VENDOR SECRET IDENTITY HOLDS.** The note on `requiredGeneratedSecret` above
+ * says "nothing here arrives from a vendor whose alphabet somebody else chose"; that sentence was
+ * true when it was written on 2026-08-05 and `TURNSTILE_SECRET` is what stops it being true. It is
+ * issued by Cloudflare in Cloudflare's own shape (`0x` followed by a mixed-alphabet tail), so
+ * `assertGeneratedSecret` is the wrong class for it and would refuse a correct key at boot —
+ * exactly the failure that comment warns against, arriving from the other direction.
+ * `assertOpaqueSecret` is the class the shared package documents for "a vendor API key", and it
+ * still catches the failures that matter: a placeholder, a marker, something far too short.
+ *
+ * **OFF IS A SUPPORTED STATE AND MUST STAY ONE.** A developer's machine, CI, and every `micro`
+ * network have no Turnstile account. With neither variable set this returns `null`,
+ * `GET /auth/challenge` answers `required: false`, hub-web renders no widget and `POST
+ * /auth/register` behaves exactly as it did before this feature existed. Making the variables
+ * required would break every environment at once, which is the same argument `accountUrl` records.
+ *
+ * **HALF-CONFIGURED IS NOT A SUPPORTED STATE.** A secret with no site key is a gate no browser can
+ * ever pass; a site key with no secret is a widget that is rendered, solved, and then verified
+ * against nothing. Both are silent — the first refuses every registration, the second accepts
+ * every one — so both fail the boot instead. An operator who wants the feature off removes both
+ * lines, which is unambiguous.
+ *
+ * **AN EMPTY ALLOWLIST WHILE ENABLED FAILS THE BOOT TOO**, and that is not hypothetical: the
+ * estate's compose file records `IDENTITY_HANDOFF_ORIGINS` shipping empty and turning
+ * `POST /auth/handoff` into a 403 for every caller. `hostnames.includes()` over an empty array is
+ * that defect verbatim, so the empty case is refused here where it is loud rather than in the
+ * verifier where it is a universal refusal nobody can explain.
+ */
+function parseTurnstile(source: Source): TurnstileConfig | null {
+  const secret = optional(source, 'TURNSTILE_SECRET', '')
+  const siteKey = optional(source, 'TURNSTILE_SITE_KEY', '')
+
+  if (!secret && !siteKey) return null
+  if (!secret || !siteKey) {
+    throw new EnvError(
+      'TURNSTILE_SECRET and TURNSTILE_SITE_KEY must be set together — one without the other is a registration gate that either refuses everyone or checks nothing',
+    )
+  }
+
+  asEnvError(() => assertOpaqueSecret('TURNSTILE_SECRET', secret))
+
+  // The site key is PUBLIC — it is served to browsers by `GET /auth/challenge` and appears in the
+  // page source. This compares the two only to catch the paste that swaps them, which is otherwise
+  // undetectable: the widget would render under the secret and the secret would be in the bundle.
+  // Neither value is named in the message.
+  if (secret === siteKey) {
+    throw new EnvError('TURNSTILE_SECRET and TURNSTILE_SITE_KEY hold the same value — the secret would be published to every browser')
+  }
+
+  const hostnames = optional(source, 'TURNSTILE_HOSTNAMES', '')
+    .split(',')
+    .map((value) => value.trim().toLowerCase())
+    .filter((value) => value.length > 0)
+
+  if (hostnames.length === 0) {
+    throw new EnvError(
+      'TURNSTILE_HOSTNAMES is required when Turnstile is enabled — an empty allowlist refuses every solved challenge',
+    )
+  }
+  for (const host of hostnames) {
+    // A HOSTNAME, not an origin: it is compared against `siteverify`'s `hostname` field, which
+    // Cloudflare returns bare. A value carrying a scheme, a port or a path would never match
+    // anything and would present as "the widget works but registration always fails".
+    if (!/^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$/.test(host)) {
+      throw new EnvError(`TURNSTILE_HOSTNAMES must be bare hostnames with no scheme, port or path (got ${host})`)
+    }
+  }
+
+  return { secret, siteKey, hostnames: Object.freeze([...new Set(hostnames)]) }
+}
+
 export interface Env {
   readonly port: number
   readonly env: string
@@ -369,6 +443,14 @@ export interface Env {
    * driven by a hijacked session can be cancelled by its real owner.
    */
   readonly deletionGraceDays: number
+  /**
+   * The registration challenge, or `null` when this deployment has no Turnstile account.
+   *
+   * `null` is not a degraded mode — it is the state every developer machine, every CI run and
+   * every `micro` network is in, and in it `POST /auth/register` is byte-for-byte the route it was
+   * before micro-org#361. See `parseTurnstile`.
+   */
+  readonly turnstile: TurnstileConfig | null
 }
 
 const LEVELS = new Set(['debug', 'info', 'warn', 'error'])
@@ -416,6 +498,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     // asks the question that matters of it: is every scope one the contracts registry knows.
     serviceTokenGrants: parseServiceGrants(optional(source, 'IDENTITY_SERVICE_TOKEN_GRANTS', '{}')),
     deletionGraceDays: integer(source, 'IDENTITY_DELETION_GRACE_DAYS', 7, 0, 365),
+    turnstile: parseTurnstile(source),
   }
 }
 

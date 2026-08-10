@@ -142,6 +142,14 @@ import {
 } from './users.ts'
 import { isUuid } from './ids.ts'
 import type { Db } from './outbox.ts'
+import {
+  REGISTER_ACTION,
+  readChallengeToken,
+  verifyChallengeToken,
+  type ChallengeOutcome,
+  type FetchLike,
+  type TurnstileConfig,
+} from './turnstile.ts'
 
 export interface ServerDeps {
   readonly lifecycle: Lifecycle
@@ -149,6 +157,23 @@ export interface ServerDeps {
   readonly metrics: Metrics
   readonly sql: Db
   readonly deletionGraceDays: number
+  /**
+   * The registration challenge, or `null` where this deployment has no Turnstile account.
+   *
+   * **Required rather than optional, and that is the point.** An optional field would let a
+   * composition root that forgot to wire it typecheck cleanly and ship a mainnet with the gate
+   * silently off — which is the same class of defect as a check that cannot fail. Writing `null`
+   * is a sentence an operator can read; omitting the field should not compile.
+   */
+  readonly turnstile: TurnstileConfig | null
+  /**
+   * How this server reaches Cloudflare. Defaults to the global `fetch`.
+   *
+   * Injected so the suite can drive Cloudflare's own documented refusals — a spent token, a token
+   * for another action, a widget on somebody else's page, an outage — without a network and
+   * without a double that can only ever say yes.
+   */
+  readonly turnstileFetch?: FetchLike
   /** Refresh sampled gauges immediately before `/metrics` renders. */
   readonly beforeScrape?: () => Promise<void>
 }
@@ -196,6 +221,19 @@ export function registerServiceMetrics(metrics: Metrics): Metrics {
     .register({
       name: 'identity_mfa_challenges_total',
       help: 'MFA step-ups, by outcome',
+      kind: 'counter',
+      labels: ['outcome'],
+    })
+    .register({
+      name: 'identity_registration_challenge_total',
+      // The label is the whole value of this counter. `rejected` rising is the control working;
+      // `upstream_failure` rising is Cloudflare unreachable and — because this service fails
+      // CLOSED — registrations being refused for a reason that is nothing to do with the caller.
+      // An operator who cannot tell those two apart cannot act on either, which is why the
+      // outcomes are not collapsed into a success/failure pair. `missing_token` separates "a
+      // client that does not implement the challenge" from "a challenge that did not hold":
+      // a stale hub-web bundle looks like an attack without it.
+      help: 'Registration challenges, by outcome: ok, missing_token, rejected, upstream_failure',
       kind: 'counter',
       labels: ['outcome'],
     })
@@ -300,6 +338,38 @@ class EmailUnverifiedError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'EmailUnverifiedError'
+  }
+}
+
+/**
+ * The registration challenge did not hold — and WHICH WAY it did not hold (micro-org#361).
+ *
+ * One class, three codes, because a client and an operator both have to act differently on each:
+ *
+ *   `challenge_required`    403 — nothing was sent. A stale bundle, a blocked script, or a scripted
+ *                                 caller. hub-web shows "complete the challenge"; it does not
+ *                                 imply the person failed one.
+ *   `challenge_failed`      403 — a token was sent and Cloudflare, or one of the two assertions
+ *                                 this service makes on top of it, refused it. THIS is the counter
+ *                                 that means "a bot was stopped".
+ *   `challenge_unavailable` 503 — Cloudflare could not be reached or could not be read. Nothing
+ *                                 about the caller was wrong. It is a 503 for the same reason
+ *                                 `UnavailableError` is: this service could not decide, and it
+ *                                 fails closed. Retrying later is the correct client behaviour and
+ *                                 the status is what says so.
+ *
+ * A single generic refusal — "that registration is not valid" — would make all three indis-
+ * tinguishable in the log, in the metric and on the screen, so an outage would present as a spike
+ * in blocked bots and a broken deploy would present as the same thing.
+ */
+class ChallengeError extends Error {
+  readonly status: number
+  readonly code: 'challenge_required' | 'challenge_failed' | 'challenge_unavailable'
+  constructor(status: number, code: ChallengeError['code'], message: string) {
+    super(message)
+    this.name = 'ChallengeError'
+    this.status = status
+    this.code = code
   }
 }
 
@@ -586,6 +656,12 @@ async function handle(
         body: { error: { code: 'rate_limited', message: err.message, requestId: ctx.requestId } },
       }
     }
+    if (err instanceof ChallengeError) {
+      // The message is safe to return: every one is built in `runRegistrationChallenge` or in
+      // turnstile.ts from Cloudflare's own error codes, the returned action and the returned
+      // hostname. None of them ever contains the token or the secret.
+      return errorReply(err.status, err.code, err.message, ctx.requestId)
+    }
     if (err instanceof UnavailableError) {
       ctx.log.error('identity could not decide', { err })
       return errorReply(503, 'unavailable', 'authentication is temporarily unavailable', ctx.requestId)
@@ -672,6 +748,137 @@ async function authenticateIdentityAdmin(
     throw new ForbiddenError('this route requires the identity:admin scope')
   }
   return claims
+}
+
+/* ------------------------------------------------------------------------ registration challenge */
+
+/**
+ * Does this caller get to skip the challenge? Only by being a SERVICE, and only by proving it.
+ *
+ * **THE BYPASS IS A PROPERTY OF THE PRINCIPAL, NEVER OF THE REQUEST.** The obvious shortcut — a
+ * header `beacon` sets, a shared string in an environment variable, an address allowlist — is a
+ * credential with none of a credential's properties: it does not expire, it cannot be revoked
+ * without a redeploy, it is copied into every caller that needs it, and (for a header or an
+ * address) it is forgeable by anyone who can send bytes. A bot that finds one has a permanent key
+ * to the route the challenge exists to protect, and nothing in a log distinguishes it from the
+ * monitor.
+ *
+ * A service token has the opposite properties. `beacon` exchanges `BEACON_IDENTITY_CREDENTIAL` for
+ * one with a 600-second life at `POST /service-tokens/exchange`, this service verifies the
+ * signature it minted, and revoking the credential closes the door immediately. So the bypass is
+ * exactly `isServiceClaims` — no additional scope, because holding an estate-issued service
+ * credential at all is already a higher bar than the challenge is.
+ *
+ * ── A BAD TOKEN FALLS THROUGH TO THE CHALLENGE, IT DOES NOT 401 ────────────────────────────────
+ *
+ * This is a PUBLIC sign-up route. Turning a malformed or expired `authorization` header into a 401
+ * would mean a browser extension that injects a stale bearer could stop a person opening an
+ * account, and would hand an attacker a way to probe token validity on an unauthenticated route.
+ * So an unusable bearer is logged at `warn` — naming why, never the token — and the caller takes
+ * the challenge like anybody else. For `beacon` that means an expired credential presents as a
+ * loud, named challenge refusal on the monitor rather than a silent bypass, which is the failure
+ * mode worth having.
+ *
+ * A USER token does not bypass either. A user who is signed in has no business creating accounts
+ * unattended, and treating any valid token as a bypass would make one leaked access token a
+ * registration cannon.
+ */
+async function challengeBypass(ctx: RequestContext, deps: ServerDeps): Promise<ServiceClaims | null> {
+  const header = headerOf(ctx.req, 'authorization')
+  const token = header?.startsWith('Bearer ') ? header.slice(7).trim() : null
+  if (!token) return null
+
+  const verified = await verifyToken(deps.sql, token)
+  if (!verified.ok) {
+    ctx.log.warn('a bearer was presented to register and could not be used; taking the challenge', {
+      reason: verified.reason,
+    })
+    return null
+  }
+  if (!isServiceClaims(verified.claims)) {
+    ctx.log.warn('a user token was presented to register; taking the challenge', {})
+    return null
+  }
+  return verified.claims
+}
+
+/**
+ * Run the challenge, or establish that this deployment does not have one.
+ *
+ * Called BEFORE `validateRegistration` and before anything is created, which is the order the
+ * route's limiter already implies: a caller who cannot pass the gate must not be able to use the
+ * route to probe which addresses and handles are taken. The cost is that a submission which is
+ * also malformed spends its token on a request that was going to be a 400 anyway — hub-web resets
+ * the widget after ANY failed request, so the person sees a fresh challenge either way.
+ *
+ * Every path through here increments `identity_registration_challenge_total` exactly once, and the
+ * `ok` label covers both a passed challenge and a bypassing service principal — the counter
+ * answers "how many registrations got through the gate", so a bypass that did not appear in it
+ * would make the denominator a lie.
+ */
+async function runRegistrationChallenge(
+  ctx: RequestContext,
+  deps: ServerDeps,
+  body: Record<string, unknown>,
+): Promise<void> {
+  const config = deps.turnstile
+  // Not configured is not "disabled by accident": `parseTurnstile` refuses a half-configured
+  // deployment at boot, so `null` here means an operator set neither variable. The route is then
+  // byte-for-byte what it was before micro-org#361 — no counter, no branch, no behaviour.
+  if (!config) return
+
+  const service = await challengeBypass(ctx, deps)
+  if (service) {
+    ctx.log.info('registration challenge bypassed by a service principal', { service: service.sub })
+    record(deps, 'ok')
+    return
+  }
+
+  const token = readChallengeToken(body)
+  if (typeof token !== 'string') {
+    record(deps, token.outcome)
+    // `token.detail` names the field and, for an over-long one, its LENGTH. That belongs in the
+    // log, where an operator debugging a stale hub-web bundle needs it; it is not what to say to a
+    // person, who did not choose the field name and cannot act on it. The code carries the
+    // machine-readable half.
+    ctx.log.warn('registration challenge refused', { outcome: token.outcome, detail: token.detail })
+    throw new ChallengeError(
+      403,
+      'challenge_required',
+      'that registration did not carry a completed challenge',
+    )
+  }
+
+  const result = await verifyChallengeToken(
+    config,
+    // The SAME address the limiter keys on, deliberately — see `clientAddress`, which records that
+    // it is attacker-supplied. Cloudflare treats `remoteip` as advisory, so a forged one can only
+    // weaken the signal on the forger's own registration; a second, cleverer notion of "who is
+    // calling" would be a second thing to keep true.
+    { token, remoteIp: clientAddress(ctx.req) },
+    deps.turnstileFetch ?? globalThis.fetch,
+  )
+
+  record(deps, result.outcome)
+  if (result.outcome === 'ok') return
+
+  // The token is never in `detail` and never in this log line.
+  ctx.log.warn('registration challenge refused', {
+    outcome: result.outcome,
+    detail: result.detail,
+    errorCodes: result.errorCodes,
+  })
+
+  if (result.outcome === 'upstream_failure') {
+    // FAIL CLOSED. The reasoning, the date, and the fact that micro-org#361 argues the other way
+    // are all written out at the top of turnstile.ts; this is the line that implements it.
+    throw new ChallengeError(503, 'challenge_unavailable', 'the registration challenge could not be checked; please try again')
+  }
+  throw new ChallengeError(403, 'challenge_failed', 'that registration challenge was not accepted')
+}
+
+function record(deps: ServerDeps, outcome: ChallengeOutcome): void {
+  deps.metrics.increment('identity_registration_challenge_total', { outcome })
 }
 
 /* ------------------------------------------------------------------------ helpers */
@@ -798,8 +1005,42 @@ function buildRoutes(): Route[] {
 
     /* ---------------------------------------------------------------- registration and sign-in */
 
+    /**
+     * What a client must do before it may register — asked at RUNTIME, answered per deployment.
+     *
+     * **The site key is not compiled into hub-web, and that is the whole reason this route exists.**
+     * micro-org#361 suggests baking it into the bundle, which is safe (it is public) and wrong for
+     * this estate: hub-web has no build-time constants at all — `src/lib/hosts.ts` derives every
+     * address from `window.location` precisely so ONE image serves localhost, the micro network and
+     * mainnet. A compiled site key would be the first thing to break that, and would need a
+     * separate build per network to fix.
+     *
+     * Unauthenticated by definition: it is asked by a person who does not have an account yet. It
+     * discloses the site key, which is published in the page source of every site that uses
+     * Turnstile, and one boolean.
+     *
+     * `required: false` is a real answer, not an error — it is what every developer machine, CI run
+     * and micro network gets, and it tells hub-web to render the form exactly as it did before.
+     */
+    define('GET', '/auth/challenge', async (_ctx, deps) => ({
+      status: 200,
+      body: deps.turnstile
+        ? { required: true, provider: 'turnstile', siteKey: deps.turnstile.siteKey, action: REGISTER_ACTION }
+        : // `siteKey: null` rather than an omitted field, so a client reading it can tell "this
+          // deployment has no challenge" from "this deployment is older than the challenge".
+          { required: false, provider: 'turnstile', siteKey: null, action: REGISTER_ACTION },
+    })),
+
     define('POST', '/auth/register', async (ctx, deps) => {
-      const validated = validateRegistration(await readJson(ctx.req))
+      const body = await readJson(ctx.req)
+
+      // BEFORE validation and before anything is created. An unchallenged caller must not be able
+      // to use this route to discover which addresses and handles are taken — the 409 from
+      // `registerUser` is an existence oracle, and a 400 naming the offending field is a weaker
+      // one. See `runRegistrationChallenge`.
+      await runRegistrationChallenge(ctx, deps, body)
+
+      const validated = validateRegistration(body)
       if (!validated.ok) {
         throw new BadRequestError('that registration is not valid', [...validated.errors])
       }
