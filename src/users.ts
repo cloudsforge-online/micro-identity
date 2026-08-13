@@ -151,6 +151,31 @@ export async function registerUser(
           // display name is a profile field a user can change to something the greeting should
           // not have been built on.
           handle: input.handle,
+          // ── THE ADDRESS, AND WHY THE WELCOME MAIL HAD NEVER BEEN SENT (micro-org#447) ────────
+          //
+          // This payload used to be `{ userId, handle, organisationId, organisationSlug }` and
+          // carried NO ADDRESS. notify's catalogue said so in as many words — "identity's
+          // registration payload ... carries **no address at all**, so there is nothing on this
+          // event for this service to keep" — and the consequence was not that the welcome mail
+          // was late. It was never sent to anybody, ever: notify routes a notification against
+          // the channel targets it holds AT FAN-OUT, the address only arrived later on
+          // `identity.email.verification_requested`, and by then the welcome notification had
+          // already been created with email unavailable and no delivery row written.
+          //
+          // So the event that says "an account exists" now carries the one fact needed to write
+          // to it. notify learns the target from THIS event, in the same transaction and before
+          // it routes (`learnAddress` runs ahead of `createNotification`), which removes the
+          // ordering problem rather than tolerating it.
+          //
+          // Safe to put on the wire here for the reason the verification event already relies on:
+          // an address is not a credential. The verification TOKEN is, which is why that one is
+          // declared in `secretParams` and this is not.
+          //
+          // The NORMALISED address — the one written to `users` above and the one
+          // `users_email_lower_uniq` is built on — not `input.email`. notify keeps this as a
+          // mirror, and a mirror of a value nothing else stores is a second spelling of the
+          // address that would never match the one identity answers with.
+          email,
           organisationId: organisation.id,
           organisationSlug: organisation.slug,
         },
