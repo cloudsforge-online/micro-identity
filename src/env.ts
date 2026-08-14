@@ -366,6 +366,16 @@ export interface Env {
    */
   readonly issuer: string
   /**
+   * The network this identity serves — stamped into every token as the `net` claim, or empty and
+   * the claim is omitted (micro-org#459 stage 2). Optional with omission BECAUSE the claim's
+   * whole rollout story depends on it: tokens without the claim verify everywhere, so an estate
+   * that has not set this yet loses nothing, and the enforcement in @cloudsforge/runtime-auth
+   * only bites on a mismatch. It becomes meaningful the day both estates trust one identity —
+   * a token minted for testnet must not pass at a mainnet service, and this is where that fact
+   * enters the token.
+   */
+  readonly network: string
+  /**
    * The key-encryption keys, BY VERSION — `IDENTITY_KEY_SECRET_V<n>`.
    *
    * Wraps the RS256 private half and every TOTP seed, AES-256-GCM under a scrypt-derived key (see
@@ -487,6 +497,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     // service that exhausts Postgres for everything else the moment it scales.
     databasePoolMax: integer(source, 'IDENTITY_DATABASE_POOL_MAX', 10, 1, 500),
     issuer: required(source, 'IDENTITY_ISSUER'),
+    network: optional(source, 'IDENTITY_NETWORK', ''),
     ...parseKeySecrets(source),
     publicUrl: origin('IDENTITY_PUBLIC_URL', required(source, 'IDENTITY_PUBLIC_URL')),
     accountUrl: accountUrl.length > 0 ? origin('IDENTITY_ACCOUNT_URL', accountUrl) : null,

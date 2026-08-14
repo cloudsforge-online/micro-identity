@@ -62,6 +62,10 @@ export async function issueAccessToken(sql: Db, subject: AccessSubject): Promise
     sid: subject.sessionId,
     amr: subject.amr,
     handle: subject.handle,
+    // The network this token is FOR (micro-org#459 stage 2). Omitted when IDENTITY_NETWORK is
+    // unset — see env.ts for why omission is the rollout story, and the runtime verifier for
+    // where a mismatch becomes a 401.
+    ...(env.network ? { net: env.network } : {}),
   }
   return new SignJWT({ ...claims })
     .setProtectedHeader({ alg: 'RS256', kid: key.kid })
@@ -105,7 +109,14 @@ export async function issueServiceToken(
   ttlSeconds: number = SERVICE_TTL_SECONDS,
 ): Promise<string> {
   const key = await getSigningKey(sql)
-  return new SignJWT({ typ: 'service', scopes: [...scopes] })
+  return new SignJWT({
+    typ: 'service',
+    scopes: [...scopes],
+    // Same claim, same reasons, and on SERVICE tokens it is the load-bearing half: user tokens
+    // cross estates by design once identity is shared, but a testnet service's ledger:post must
+    // never pass at the mainnet ledger (micro-org#459 stage 2).
+    ...(env.network ? { net: env.network } : {}),
+  })
     .setProtectedHeader({ alg: 'RS256', kid: key.kid })
     // `service:<name>`, which is how the runtime verifier decides this is not a user. A service
     // token accepted where a user token was expected would make `sub` — a service name — look like
