@@ -62,10 +62,15 @@ export async function issueAccessToken(sql: Db, subject: AccessSubject): Promise
     sid: subject.sessionId,
     amr: subject.amr,
     handle: subject.handle,
-    // The network this token is FOR (micro-org#459 stage 2). Omitted when IDENTITY_NETWORK is
-    // unset — see env.ts for why omission is the rollout story, and the runtime verifier for
-    // where a mismatch becomes a 401.
-    ...(env.network ? { net: env.network } : {}),
+    // ── NO net CLAIM ON USER TOKENS, AND THAT IS THE DESIGN, NOT AN OMISSION (micro-org#459) ──
+    //
+    // The first version stamped user tokens too, and it would have broken the one thing stage 2
+    // exists to deliver: with one identity serving both estates, a person's mainnet-minted token
+    // would be refused by every testnet service the moment they used the network switcher —
+    // net=mainnet, AUTH_EXPECTED_NETWORK=testnet, 401 wrong_network. A USER is one account with
+    // per-network data, and their token must cross; a SERVICE is estate-bound, and its token
+    // must not. The claim therefore lives on service tokens alone (below), which is also where
+    // the threat lives — a testnet service's ledger:post passing at the mainnet ledger.
   }
   return new SignJWT({ ...claims })
     .setProtectedHeader({ alg: 'RS256', kid: key.kid })
