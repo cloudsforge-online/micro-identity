@@ -112,15 +112,25 @@ export async function issueServiceToken(
   scopes: readonly Scope[],
   jti: string,
   ttlSeconds: number = SERVICE_TTL_SECONDS,
+  network: string | null = null,
 ): Promise<string> {
   const key = await getSigningKey(sql)
+  // `net` names the estate the token is FOR, which under the shared identity (micro-org#459 the
+  // combined view) is not always the estate the identity runs in. A testnet service exchanging its
+  // credential HERE, at the mainnet identity, must get net=testnet — stamping this deployment's own
+  // IDENTITY_NETWORK on it was the combined view's first live defect: custody refused settlement
+  // with "token minted for network mainnet, this deployment is testnet" in an every-two-minutes
+  // remint loop, and the same token would have PASSED at the mainnet ledger, the exact crossing the
+  // claim exists to refuse. The caller (the credential row's `network` column, threaded through
+  // `issueServiceTokenFor`) knows the estate; this deployment's env is only the fallback.
+  const net = network ?? env.network
   return new SignJWT({
     typ: 'service',
     scopes: [...scopes],
     // Same claim, same reasons, and on SERVICE tokens it is the load-bearing half: user tokens
     // cross estates by design once identity is shared, but a testnet service's ledger:post must
     // never pass at the mainnet ledger (micro-org#459 stage 2).
-    ...(env.network ? { net: env.network } : {}),
+    ...(net ? { net } : {}),
   })
     .setProtectedHeader({ alg: 'RS256', kid: key.kid })
     // `service:<name>`, which is how the runtime verifier decides this is not a user. A service

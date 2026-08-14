@@ -81,6 +81,13 @@ export interface IssueServiceTokenInput {
   readonly correlationId: string
   /** Requested lifetime. Clamped to `SERVICE_TTL_SECONDS`; may only shorten. */
   readonly ttlSeconds?: number | null
+  /**
+   * The estate the token is FOR — the `net` claim. Comes from the credential row when a machine
+   * minted (serviceCredentials.ts), and is absent on the operator path, where it falls back to this
+   * deployment's own `IDENTITY_NETWORK` inside `issueServiceToken`. See the comment there for the
+   * live defect that made this a parameter rather than an env read.
+   */
+  readonly network?: string | null
 }
 
 export interface IssuedServiceToken {
@@ -145,7 +152,7 @@ export async function issueServiceTokenFor(
     )
   `
 
-  const token = await issueServiceToken(sql, input.service, requested, jti, ttl)
+  const token = await issueServiceToken(sql, input.service, requested, jti, ttl, input.network ?? null)
   return {
     token,
     jti,

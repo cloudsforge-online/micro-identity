@@ -1940,11 +1940,15 @@ function buildRoutes(): Route[] {
       const body = await readJson(ctx.req)
       const service = requireString(body, 'service')
       const label = optionalString(body, 'label') ?? `${service} credential`
+      // The estate the credential mints for (the `net` claim on every token it buys). Omitted means
+      // this identity's own — the only case there was before the combined view (micro-org#459).
+      const network = optionalString(body, 'network') ?? null
 
       const created = await createServiceCredential(deps.sql, {
         service,
         label,
         createdBy: claims.sub,
+        network,
       })
       ctx.log.info('service credential created', {
         audit: 'service_credential_created',
