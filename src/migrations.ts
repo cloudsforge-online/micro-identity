@@ -779,6 +779,44 @@ export const MIGRATIONS: readonly Migration[] = [
        where email_verified_at is null and status <> 'deleted';
     `,
   },
+  {
+    version: 14,
+    name: 'service_credentials_network',
+    // **Which estate a credential mints for — the combined view's first live defect.**
+    //
+    // Under micro-org#459 this identity mints for BOTH estates: the 19 testnet services exchange
+    // their credentials here. Migration 11 predates that world, so the only network anywhere in the
+    // mint path was `IDENTITY_NETWORK` — this deployment's own — and every token said `net=mainnet`
+    // regardless of who exchanged. Observed live within hours of the flip, both ways at once:
+    // testnet custody refusing testnet settlement ("token minted for network mainnet, this
+    // deployment is testnet", a remint loop every ~2 minutes), while the same token would have
+    // VERIFIED at the mainnet ledger — the crossing the `net` claim was built to refuse.
+    //
+    // The row is the right home because the row already answers the analogous question for the
+    // service name: `exchangeServiceCredential` reads `service` from the row, never the request,
+    // so a caller cannot name its own service — and it must not be able to name its own estate
+    // either, or the claim is advisory. Same column shape as the claim: free text naming an estate,
+    // because estates are names here ('mainnet', 'testnet'), not an enum the schema should freeze.
+    //
+    // NULL means "this identity's own network" (the fallback in tokens.ts), which is what every
+    // credential minted before the combined view meant implicitly — so existing mainnet rows need
+    // no backfill and behave exactly as before. The 19 testnet-labelled rows provisioned for the
+    // flip are set right here rather than by a hand UPDATE on the host: the defect was live when
+    // this migration was written, and a deploy that ships the code without the data would keep the
+    // remint loop running until an operator remembered.
+    up: `
+      alter table service_credentials
+        add column if not exists network text;
+
+      -- The flip's provisioning (micro-org#459, 2026-08-14) labelled every testnet-estate
+      -- credential 'testnet' precisely so they would be findable as a set. This is that promise
+      -- being kept. Scoped to the label AND to rows still unset, so a future credential whose
+      -- label happens to collide is not silently re-pointed.
+      update service_credentials
+         set network = 'testnet'
+       where label = 'testnet' and network is null;
+    `,
+  },
 ]
 
 /**

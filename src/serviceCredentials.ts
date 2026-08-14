@@ -165,7 +165,7 @@ export interface NewServiceCredential {
  */
 export async function createServiceCredential(
   sql: Db,
-  input: { service: string; label: string; createdBy: string | null },
+  input: { service: string; label: string; createdBy: string | null; network?: string | null },
 ): Promise<NewServiceCredential> {
   if (!env.serviceTokenGrants[input.service]) {
     throw new UnconfiguredServiceError(input.service)
@@ -174,8 +174,9 @@ export async function createServiceCredential(
   const secret = CREDENTIAL_PREFIX + randomBytes(32).toString('base64url')
   const id = uuidv7()
   await sql`
-    insert into service_credentials (id, service, secret_hash, label, created_by)
-    values (${id}, ${input.service}, ${digest(secret)}, ${input.label}, ${input.createdBy})
+    insert into service_credentials (id, service, secret_hash, label, created_by, network)
+    values (${id}, ${input.service}, ${digest(secret)}, ${input.label}, ${input.createdBy},
+            ${input.network ?? null})
   `
   return { id, service: input.service, label: input.label, secret }
 }
@@ -185,6 +186,8 @@ interface CredentialRow {
   readonly service: string
   readonly secret_hash: string
   readonly revoked_at: Date | null
+  /** The estate this credential mints for. Null falls back to the identity's own network. */
+  readonly network: string | null
 }
 
 /**
@@ -201,7 +204,7 @@ interface CredentialRow {
 async function resolve(sql: Db, presented: string): Promise<CredentialRow> {
   const hash = digest(presented)
   const rows = await sql<CredentialRow[]>`
-    select id, service, secret_hash, revoked_at from service_credentials
+    select id, service, secret_hash, revoked_at, network from service_credentials
      where secret_hash = ${hash} limit 1
   `
   const row = rows[0]
@@ -260,6 +263,13 @@ export async function exchangeServiceCredential(
     issuedByCredential: row.id,
     correlationId: input.correlationId,
     ttlSeconds: input.ttlSeconds ?? null,
+    // The `net` claim comes from the ROW, exactly as the service name does and for the same
+    // reason: under the shared identity (micro-org#459) a testnet service exchanges HERE, and a
+    // token stamped with this deployment's own network both fails at the service's own estate and
+    // passes at the other one — backwards twice. Null (every credential minted before the combined
+    // view) falls back to `IDENTITY_NETWORK`, which is correct for an identity minting for its own
+    // estate and is why this needed no flag-day.
+    network: row.network,
   })
 
   await sql`update service_credentials set last_used_at = now() where id = ${row.id}`

@@ -182,6 +182,37 @@ test('the service minted for comes from the row, never from the request', { skip
   )
 })
 
+test('the net claim comes from the row, never from the deployment', { skip }, async () => {
+  // The combined view's first live defect (micro-org#459, migration 14). One identity mints for
+  // both estates, so the estate a token is FOR is a property of the CREDENTIAL — exactly like the
+  // service name, and asserted the same way. Stamping the deployment's own IDENTITY_NETWORK put
+  // testnet custody in a remint-refuse loop against testnet settlement ("token minted for network
+  // mainnet, this deployment is testnet") while the same token would have passed at the mainnet
+  // ledger — the crossing the claim exists to refuse.
+  const claimsOf = (token: string): Record<string, unknown> =>
+    JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString('utf8'))
+
+  const testnet = await createServiceCredential(db, {
+    service: SERVICE,
+    label: 'testnet',
+    createdBy: null,
+    network: 'testnet',
+  })
+  // This suite's identity names NO network of its own (no IDENTITY_NETWORK in testsupport), so a
+  // 'testnet' in the token can only have come from the row.
+  assert.equal(claimsOf((await mint(testnet.secret)).token)['net'], 'testnet')
+
+  // And a row with no network is every credential minted before the combined view: the deployment
+  // fallback — absent here — leaves the claim off, exactly the pre-#459 token shape. That absence
+  // is the rollout property that let verifiers arm a release early, and it must stay reachable.
+  const own = await createServiceCredential(db, {
+    service: SERVICE,
+    label: 'own estate',
+    createdBy: null,
+  })
+  assert.equal('net' in claimsOf((await mint(own.secret)).token), false)
+})
+
 test('omitting scopes yields exactly the allowlist, and no wildcard exists', { skip }, async () => {
   const credential = await createServiceCredential(db, {
     service: SERVICE,
