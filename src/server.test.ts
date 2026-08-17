@@ -29,6 +29,7 @@ import { Logger, Metrics, registerHttpMetrics, registerJobMetrics } from '@cloud
 import { SCOPE_NAMES } from '@cloudsforge/contracts-auth'
 import type postgres from 'postgres'
 import { createServer, registerServiceMetrics } from './server.ts'
+import { HANDOFF_ORIGIN_REFUSED_CODE } from './handoff.ts'
 import { requestEmailVerification } from './emailVerification.ts'
 import { WEBAUTHN_NOT_IMPLEMENTED } from './mfa.ts'
 import { DEFAULT_PARAMS, base32Decode, totp } from './totp.ts'
@@ -1316,6 +1317,64 @@ test('a hand-off code is minted for an allowlisted origin and redeemed once', { 
     })).status,
     401,
     'single use',
+  )
+})
+
+test('the allowlist refusal and the stale-session refusal are DIFFERENT on the wire', { skip }, async () => {
+  /*
+   * micro-org#480, and the whole of it. `POST /auth/handoff` refuses in two ways and they have
+   * nothing to do with each other:
+   *
+   *   401 unauthenticated       — the bearer is missing, malformed, or EXPIRED. Nothing is wrong
+   *                               with the estate. Sign in again.
+   *   403 handoff_origin_refused — the origin is genuinely not on IDENTITY_HANDOFF_ORIGINS. An
+   *                               operator has to change a deployment.
+   *
+   * They answered `401 unauthenticated` and `403 forbidden`, which is already two different
+   * answers — but `@cloudsforge/ui`'s `mintHandoffCode` collapses every non-2xx to `null`, so the
+   * sign-in surface saw ONE outcome and picked the sentence for the second: "ask an operator to
+   * add it to the hand-off allowlist". The owner hit it against `https://cloudsforge.online`,
+   * which was on the allowlist the whole time and minted 201 when asked with a live token — what
+   * they actually had was a fifteen-minute-old access token out of `localStorage` after a browser
+   * restart.
+   *
+   * A distinct CODE is what lets that client stop guessing. This test is the contract: the two
+   * refusals must never again be one string, whatever the statuses do.
+   */
+  const registered = await register()
+
+  const staleSession = await call('POST', '/auth/handoff', {
+    // Stands in for an expired token, and stands in for it honestly: `authenticateUser` refuses
+    // both by the same path and `a missing, malformed or expired token is 401` above pins that the
+    // three are one answer. What matters here is that a refusal of the CALLER never carries the
+    // code that means a refusal of the ORIGIN.
+    token: 'not-a-jwt',
+    body: { redirectOrigin: 'https://app.test.cloudsforge.local' },
+  })
+  assert.equal(staleSession.status, 401, 'an unusable bearer is 401, even for an allowlisted origin')
+  assert.equal(
+    (staleSession.body['error'] as Record<string, unknown>)['code'],
+    'unauthenticated',
+    'a stale session must NOT be reported as an allowlist fault — this is the defect',
+  )
+
+  const unlistedOrigin = await call('POST', '/auth/handoff', {
+    token: registered.accessToken,
+    body: { redirectOrigin: 'https://evil.example' },
+  })
+  assert.equal(unlistedOrigin.status, 403)
+  assert.equal(
+    (unlistedOrigin.body['error'] as Record<string, unknown>)['code'],
+    HANDOFF_ORIGIN_REFUSED_CODE,
+    'the ONE answer a client may print "ask an operator to add it to the allowlist" for',
+  )
+
+  // And the two codes are not the same string, said outright rather than left to be inferred from
+  // the two assertions above — this is the property, and a future rename that collapsed them would
+  // pass both of those individually.
+  assert.notEqual(
+    (staleSession.body['error'] as Record<string, unknown>)['code'],
+    (unlistedOrigin.body['error'] as Record<string, unknown>)['code'],
   )
 })
 

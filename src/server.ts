@@ -90,7 +90,7 @@ import {
   reportVerificationDelivery,
   requestEmailVerification,
 } from './emailVerification.ts'
-import { createHandoffCode, redeemHandoffCode } from './handoff.ts'
+import { HANDOFF_ORIGIN_REFUSED_CODE, createHandoffCode, redeemHandoffCode } from './handoff.ts'
 import {
   ScopeNotGrantedError,
   UnknownScopeError,
@@ -323,6 +323,46 @@ class NotFoundError extends Error {
   constructor(message: string) {
     super(message)
     this.name = 'NotFoundError'
+  }
+}
+
+/**
+ * `POST /auth/handoff` was asked to mint for an origin that is not on `IDENTITY_HANDOFF_ORIGINS`.
+ *
+ * ── WHY THIS IS ITS OWN CLASS AND ITS OWN CODE (micro-org#480) ────────────────────────────────
+ *
+ * It was a `ForbiddenError`, so it answered 403 `forbidden` — and the estate's sign-in surface
+ * could not tell it apart from the OTHER way this route refuses, which is a 401 for a token
+ * identity will not accept. `@cloudsforge/ui`'s `mintHandoffCode` collapses every non-2xx answer
+ * to `null`, hub-web maps that `null` to one sentence, and the sentence it chose names the
+ * allowlist:
+ *
+ *   "You are signed in, but CloudsForge will not hand a session to https://cloudsforge.online.
+ *    … ask an operator to add it to the hand-off allowlist."
+ *
+ * MEASURED on 2026-08-17: the apex WAS on the live allowlist, `POST /auth/handoff` answered 201
+ * for it, and identity's audit log held not one `handoff_refused` for that origin. What the owner
+ * actually hit is the 401 — hub keeps its tokens in `localStorage`, so they survive a browser
+ * restart, `hasSession()` is a presence check rather than an expiry check, and the access token
+ * this route is handed after the browser has been shut for longer than `ACCESS_TTL_SECONDS` is
+ * simply expired. The user was told to go and ask an operator to fix a list that was already
+ * correct.
+ *
+ * That is the same failure `estate-verify.sh` records in its own SSO drill, in the same words: a
+ * check — or a message — that cannot tell "the thing is broken" from "I could not present a
+ * session" is worse than none, because it names a specific, plausible, already-correct cause and
+ * spends the next person's time on it.
+ *
+ * So the two refusals are now distinguishable ON THE WIRE, which is the only place a browser can
+ * see the difference. `handoff_origin_refused` means what the message says and a client may print
+ * it; a 401 means the session is stale and the only useful thing on screen is a sign-in form. The
+ * status stays 403 — the caller authenticated perfectly well and is being refused something —
+ * exactly as `email_unverified` does, and for the same stated reason: the client can ACT on it.
+ */
+class HandoffOriginRefusedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'HandoffOriginRefusedError'
   }
 }
 
@@ -608,6 +648,13 @@ async function handle(
       // 403 and not 401: the caller authenticated perfectly well and is being refused something.
       // The code is what hub-web branches on to offer a resend.
       return errorReply(403, 'email_unverified', err.message, ctx.requestId)
+    }
+    if (err instanceof HandoffOriginRefusedError) {
+      // 403 for the same reason `email_unverified` is one, and a code of its own for the same
+      // reason too: this is the ONLY answer from `/auth/handoff` that means the allowlist. A
+      // client that prints "ask an operator to add it to the allowlist" for anything else is
+      // reporting a configuration fault that does not exist — micro-org#480, where it did.
+      return errorReply(403, HANDOFF_ORIGIN_REFUSED_CODE, err.message, ctx.requestId)
     }
     if (err instanceof ReauthenticationRequiredError) {
       return errorReply(403, 'reauthentication_required', err.message, ctx.requestId)
@@ -1593,7 +1640,11 @@ function buildRoutes(): Route[] {
         // own attacker-controlled input, not a secret, so naming it costs nothing and is the single
         // fact whoever reads this line needs.
         ctx.log.warn('hand-off origin refused', { audit: 'handoff_refused', userId: claims.sub, redirectOrigin })
-        throw new ForbiddenError('that origin is not on the hand-off allowlist')
+        // `HandoffOriginRefusedError`, not `ForbiddenError`: a plain 403 `forbidden` here is
+        // indistinguishable to a browser from the 401 `authenticateUser` threw two lines above,
+        // and micro-org#480 is what that cost — a signed-in reader with a fifteen-minute-old
+        // access token was told the estate's own apex was not on the allowlist it was on.
+        throw new HandoffOriginRefusedError('that origin is not on the hand-off allowlist')
       }
       return { status: 201, body: { code, expiresInSeconds: 60 } }
     }),
