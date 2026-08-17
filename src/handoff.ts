@@ -25,6 +25,17 @@ import type { Db } from './outbox.ts'
 
 const CODE_TTL_MS = 60_000
 
+/**
+ * The error code `POST /auth/handoff` answers with when — and ONLY when — the allowlist refused.
+ *
+ * Spelled once, here beside the list it is about, because it is a CONTRACT with the sign-in
+ * surface rather than an implementation detail of the route: hub-web prints "ask an operator to
+ * add it to the hand-off allowlist", and that sentence is true of this code and of nothing else
+ * this route can answer. See `HandoffOriginRefusedError` in server.ts for what printing it for a
+ * 401 cost (micro-org#480).
+ */
+export const HANDOFF_ORIGIN_REFUSED_CODE = 'handoff_origin_refused'
+
 const hashCode = (code: string): string => createHash('sha256').update(code).digest('hex')
 
 /**
