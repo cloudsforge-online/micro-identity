@@ -122,6 +122,9 @@ const server = createServer({
   logger,
   metrics,
   sql: sql as unknown as Db,
+  // `pnpm dev` only. In the estate the gateway stamps `CF-Network` on every request and this stays
+  // unset, because the estate a request belongs to is a fact about the request.
+  ...(env.singleNetwork ? { singleNetwork: env.singleNetwork as 'mainnet' | 'testnet' } : {}),
   deletionGraceDays: env.deletionGraceDays,
   // `null` on any deployment without a Turnstile account, which is every developer machine and
   // every micro network — `parseTurnstile` refuses the half-configured middle, so this is either

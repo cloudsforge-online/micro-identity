@@ -376,6 +376,14 @@ export interface Env {
    */
   readonly network: string
   /**
+   * `CF_NETWORK_SINGLE`: the estate to assume when no `CF-Network` arrives. For `pnpm dev`, which
+   * has no gateway. NEVER set in production.
+   *
+   * NOT a database selector — identity keeps one account set and one database (micro-org#459).
+   * It decides the `net` claim's fallback for a credential minted before the combined view.
+   */
+  readonly singleNetwork: string
+  /**
    * The key-encryption keys, BY VERSION — `IDENTITY_KEY_SECRET_V<n>`.
    *
    * Wraps the RS256 private half and every TOTP seed, AES-256-GCM under a scrypt-derived key (see
@@ -498,6 +506,7 @@ export function loadEnv(source: Source = process.env, host = ''): Env {
     databasePoolMax: integer(source, 'IDENTITY_DATABASE_POOL_MAX', 10, 1, 500),
     issuer: required(source, 'IDENTITY_ISSUER'),
     network: optional(source, 'IDENTITY_NETWORK', ''),
+    singleNetwork: optional(source, 'CF_NETWORK_SINGLE', ''),
     ...parseKeySecrets(source),
     publicUrl: origin('IDENTITY_PUBLIC_URL', required(source, 'IDENTITY_PUBLIC_URL')),
     accountUrl: accountUrl.length > 0 ? origin('IDENTITY_ACCOUNT_URL', accountUrl) : null,

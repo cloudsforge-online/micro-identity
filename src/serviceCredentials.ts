@@ -228,6 +228,20 @@ export interface ExchangeInput {
   /** Clamped to `SERVICE_TTL_SECONDS`. May only shorten — see `clampServiceTtl`. */
   readonly ttlSeconds?: number | null | undefined
   readonly correlationId: string
+  /**
+   * The estate the REQUEST came from, from `CF-Network`. Used only when the credential row has no
+   * `network` of its own — every credential minted before the combined view (micro-org#459).
+   *
+   * Before the consolidation that fallback was `IDENTITY_NETWORK`, and it was right: the pod
+   * served one estate, so its own network and the caller's were the same thing. One pod now serves
+   * both, and `IDENTITY_NETWORK` names whichever estate the deployment was labelled with — so a
+   * testnet service presenting a pre-#459 credential would get `net=mainnet`, which FAILS at its
+   * own estate and PASSES at the other one. Backwards twice, exactly the defect the claim exists
+   * to prevent.
+   *
+   * Optional, so a single-network deployment and every existing caller keep today's behaviour.
+   */
+  readonly requestNetwork?: string | undefined
 }
 
 /**
@@ -267,9 +281,10 @@ export async function exchangeServiceCredential(
     // reason: under the shared identity (micro-org#459) a testnet service exchanges HERE, and a
     // token stamped with this deployment's own network both fails at the service's own estate and
     // passes at the other one — backwards twice. Null (every credential minted before the combined
-    // view) falls back to `IDENTITY_NETWORK`, which is correct for an identity minting for its own
-    // estate and is why this needed no flag-day.
-    network: row.network,
+    // view) falls back to the REQUEST's estate, and only then to `IDENTITY_NETWORK`. That middle
+    // step is the network consolidation: `IDENTITY_NETWORK` was right while this pod served one
+    // estate, and names the wrong one as soon as it serves both.
+    network: row.network ?? input.requestNetwork ?? null,
   })
 
   await sql`update service_credentials set last_used_at = now() where id = ${row.id}`
