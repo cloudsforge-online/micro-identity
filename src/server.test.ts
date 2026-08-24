@@ -99,6 +99,10 @@ before(async () => {
     logger: new Logger({ service: 'identity-test', level: 'error', sink: () => {} }),
     metrics: registerServiceMetrics(registerJobMetrics(registerHttpMetrics(new Metrics()))),
     sql: db,
+    // The harness talks to the server directly, with no gateway to stamp `CF-Network`. Same
+    // position as `pnpm dev`, and the same setting covers it — every route would otherwise answer
+    // 500 `network_unknown`, which is deliberate for a real request and wrong for this one.
+    singleNetwork: 'mainnet' as const,
     deletionGraceDays: 0,
     // NOT configured, which is the state every developer machine and every micro network is in.
     // Every other test in this file runs against it, so a gate that leaked into this path would
@@ -115,6 +119,10 @@ before(async () => {
     logger: new Logger({ service: 'identity-test-challenged', level: 'error', sink: () => {} }),
     metrics: registerServiceMetrics(registerJobMetrics(registerHttpMetrics(new Metrics()))),
     sql: db,
+    // The harness talks to the server directly, with no gateway to stamp `CF-Network`. Same
+    // position as `pnpm dev`, and the same setting covers it — every route would otherwise answer
+    // 500 `network_unknown`, which is deliberate for a real request and wrong for this one.
+    singleNetwork: 'mainnet' as const,
     deletionGraceDays: 0,
     turnstile: {
       secret: TURNSTILE_SECRET_FIXTURE,

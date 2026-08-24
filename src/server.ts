@@ -21,6 +21,7 @@
  *      questions about who you are is a wrong answer served to the next person.
  */
 
+import { NetworkUnknownError, requestNetwork, type Network } from '@cloudsforge/http'
 import {
   createServer as createHttpServer,
   type IncomingMessage,
@@ -156,6 +157,11 @@ export interface ServerDeps {
   readonly logger: Logger
   readonly metrics: Metrics
   readonly sql: Db
+  /**
+   * `CF_NETWORK_SINGLE`, for `pnpm dev`, which has no gateway to stamp the header. Never set in
+   * production: the estate must come from the request, not from the process.
+   */
+  readonly singleNetwork?: Network
   readonly deletionGraceDays: number
   /**
    * The registration challenge, or `null` where this deployment has no Turnstile account.
@@ -258,12 +264,35 @@ interface Reply {
   readonly after?: () => Promise<void>
 }
 
+/**
+ * Routes that answer without belonging to a network.
+ *
+ * Kubelet probes the first two and Prometheus scrapes the third; none arrives through the gateway,
+ * so none carries `CF-Network`. Refusing them turns a data-isolation rule into a CrashLoopBackOff.
+ */
+const OPERATIONAL_ROUTES: ReadonlySet<string> = new Set(['/livez', '/readyz', '/metrics'])
+
 interface RequestContext {
   readonly req: IncomingMessage
   readonly url: URL
   readonly requestId: string
   readonly log: Logger
   readonly params: Readonly<Record<string, string>>
+  /**
+   * The estate this REQUEST belongs to, from the `CF-Network` header the gateway stamped.
+   *
+   * identity is a class B′ singleton: ONE account set, ONE database, both estates (micro-org#459).
+   * So this is NOT a database selector — there is nothing to select. It is here for the two things
+   * that are genuinely per-estate:
+   *
+   *   1. the `network` label on the HTTP metrics, so one pod's two estates stay separable, and
+   *   2. the FALLBACK for the `net` claim when a service credential predates the combined view.
+   *
+   * That second one is the substance of this wave. `net` comes from the credential row and falls
+   * back to `IDENTITY_NETWORK` — which was right when this pod served one estate and means nothing
+   * once it serves both. The request knows; the process no longer does.
+   */
+  readonly network: Network
 }
 
 interface Route {
@@ -512,19 +541,51 @@ export function createServer(deps: ServerDeps): Server {
     inFlight += 1
     deps.metrics.set('http_requests_in_flight', inFlight)
 
-    const finish = (status: number) => {
+    const finish = (status: number, metricNetwork: string) => {
       inFlight -= 1
       deps.metrics.set('http_requests_in_flight', inFlight)
       const durationMs = Number(process.hrtime.bigint() - startedAt) / 1e6
-      deps.metrics.increment('http_requests_total', { method, route: routeLabel, status: String(status) })
-      deps.metrics.observe('http_request_duration_ms', durationMs, { method, route: routeLabel })
+      // One target now serves both estates, so the network has to be on the SERIES. Labelled per
+      // target it would say nothing — micro-org#398 in a form nothing could recover.
+      deps.metrics.increment('http_requests_total', {
+        method,
+        route: routeLabel,
+        status: String(status),
+        network: metricNetwork,
+      })
+      deps.metrics.observe('http_request_duration_ms', durationMs, {
+        method,
+        route: routeLabel,
+        network: metricNetwork,
+      })
     }
 
-    const ctx: RequestContext = { req, url, requestId, log, params }
+    // ── THE ESTATE THIS REQUEST BELONGS TO ────────────────────────────────────────────────────
+    //
+    // `requestNetwork` REFUSES an unstamped request rather than assuming mainnet. identity has one
+    // database, so a wrong answer here does not misfile a row — it stamps the wrong `net` on a
+    // service token, which is worse: the token then fails at its own estate AND passes at the
+    // other one, backwards twice. That was the combined view's first live defect (micro-org#459).
+    const networkless = matched !== undefined && OPERATIONAL_ROUTES.has(matched.path)
+    let network: Network
+    try {
+      network = networkless
+        ? (deps.singleNetwork ?? 'mainnet')
+        : requestNetwork(req.headers, deps.singleNetwork ? { fallback: deps.singleNetwork } : {})
+    } catch (err) {
+      log.error('request carries no usable network', {
+        err: err instanceof NetworkUnknownError ? err.message : err,
+      })
+      send(res, errorReply(500, 'network_unknown', 'this request could not be attributed to a network', requestId), requestId)
+      finish(500, 'unknown')
+      return
+    }
+
+    const ctx: RequestContext = { req, url, requestId, log, params, network }
     void handle(matched, ctx, deps, limiter)
       .then((reply) => {
         send(res, reply, requestId)
-        finish(reply.status)
+        finish(reply.status, network)
         if (reply.after) {
           // The last guarantee. Everything a route defers is written not to throw, and this is what
           // stands between a mistake there and an unhandled rejection taking the process down.
@@ -534,7 +595,7 @@ export function createServer(deps: ServerDeps): Server {
       .catch((err: unknown) => {
         log.error('request handler threw after mapping', { err })
         send(res, errorReply(500, 'internal', 'the request could not be completed', requestId), requestId)
-        finish(500)
+        finish(500, network)
       })
   })
 }
@@ -1954,6 +2015,8 @@ function buildRoutes(): Route[] {
         scopes: rawScopes as string[] | undefined,
         ttlSeconds: readTtlSeconds(body),
         correlationId: ctx.requestId,
+        // Only reached when the credential row predates the combined view. See `ExchangeInput`.
+        requestNetwork: ctx.network,
       })
       deps.metrics.increment('identity_service_tokens_issued_total', { service: issued.service })
       ctx.log.info('service token issued from a credential', {
